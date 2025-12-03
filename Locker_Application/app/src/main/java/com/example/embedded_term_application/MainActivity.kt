@@ -1,4 +1,4 @@
-package com.example.embedded_termproject
+package com.example.embedded_term_application
 
 import android.Manifest
 import android.annotation.SuppressLint
