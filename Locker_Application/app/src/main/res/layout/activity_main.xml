@@ -19,6 +19,20 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent" />
 
+    <Button
+        android:id="@+id/btnBluetoothConnect"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="BT 연결"
+        android:textColor="#FFFFFF"
+        android:textStyle="bold"
+        android:backgroundTint="#2196F3"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        app:layout_constraintBottom_toBottomOf="@id/tvTitle"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="@id/tvTitle" />
+
     <androidx.cardview.widget.CardView
         android:id="@+id/cvStatusPanel"
         android:layout_width="0dp"
@@ -164,9 +178,8 @@
                 android:id="@+id/tvLogResult"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="2023-10-27 14:00:00 - OPEN\n2023-10-27 14:05:00 - CLOSE\n..."
                 android:lineSpacingExtra="4dp"
-                android:textColor="#666666"/>
+                android:textColor="#666666" />
         </ScrollView>
     </LinearLayout>
 
