@@ -32,6 +32,10 @@ volatile uint32_t g_DoorOpenCount = 0;
 volatile uint32_t g_Temperature = 0;
 volatile uint32_t g_Humidity = 0;
 
+// 5. 진동 센서
+volatile uint32_t g_VibrationCount = 0;   // 총 진동 횟수
+volatile uint8_t  g_VibrationDetected = 0; // 현재 상태 (0:조용, 1:진동)
+
 /* function prototype */
 void RCC_Configure(void);
 void GPIO_Configure(void);
@@ -114,18 +118,20 @@ void GPIO_Configure(void)
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
 
-	// ==========================================
-    // [추가] 불꽃감지 센서 (Flame Sensor) Pin Setting
-    // Pin: PD3
-    // Mode: Input Pull-Up (평소 High, 감지 시 Low로 떨어지는 모듈이 많음)
-    // ==========================================
+	
+    /* 4. 불꽃 감지 센서 */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU; // 풀업 입력 설정
     GPIO_Init(GPIOD, &GPIO_InitStructure);
 
-	/* 5. [NEW] 리드 스위치 (PC3) - 문 감지 */
+	/* 5. 리드 스위치 (PC3) - 문 감지 */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU; // 내부 풀업 사용
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+	/* 6. 진동 센서 (PC1) */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING; // 보통 모듈은 Floating 사용
     GPIO_Init(GPIOC, &GPIO_InitStructure);
 }
 
@@ -349,6 +355,9 @@ int main(void)
     uint8_t lastDoorState = 0;
 	/* [추가] 온습도 센서 타이머용 변수 */
     int dht_timer = 0;
+	// [추가] 진동 센서 이전 상태 저장 변수
+    uint8_t lastVibState = 0;
+    lastVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
     
     // 초기 문 상태 읽기
     lastDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
@@ -417,6 +426,25 @@ int main(void)
             }
             // 실패하면 이전 값 유지 (혹은 에러처리)
         }
+
+		/* -------------------------------------------
+         * 4. [NEW] 진동 센서 (PC1)
+         * ------------------------------------------- */
+        uint8_t currentVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
+        g_VibrationDetected = currentVibState;
+
+        // 진동 감지 (0 -> 1 : Rising Edge)
+        // 평소엔 0이다가 흔들리면 1이 되는 타입 기준
+        if (lastVibState == 0 && currentVibState == 1) 
+        {
+            g_VibrationCount++; // 카운트 증가
+            
+            // [중요] 진동은 타다닥! 하고 여러 번 울리므로
+            // 한번 감지하면 0.05초 정도는 무시해줍니다.
+            Delay_ms(50); 
+        }
+        
+        lastVibState = currentVibState;
 
         /* 루프 딜레이 */
         Delay_ms(10);
