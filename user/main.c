@@ -19,6 +19,9 @@ long Zero_Offset = 0;
 volatile float weight = 0.0f;
 volatile long raw_data = 0;
 
+// 불꽃 감지 상태 확인용 변수
+volatile uint8_t flame_detected = 0;
+
 /* function prototype */
 void RCC_Configure(void);
 void GPIO_Configure(void);
@@ -40,7 +43,7 @@ void RCC_Configure(void)
 {  
 	/* USART1, USART2 TX/RX port clock enable */
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE); // USART1 (PA9, PA10)
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOD, ENABLE); // USART2 (PD5, PD6)
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOD, ENABLE); // USART2 (PD5, PD6), 불꽃 감지 (PD3)
 
 	/* HX711 clock enable*/
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE); // DATA - PB6, SCK - PB6
@@ -92,6 +95,14 @@ void GPIO_Configure(void)
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
 
+	// ==========================================
+    // [추가] 불꽃감지 센서 (Flame Sensor) Pin Setting
+    // Pin: PD3
+    // Mode: Input Pull-Up (평소 High, 감지 시 Low로 떨어지는 모듈이 많음)
+    // ==========================================
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU; // 풀업 입력 설정
+    GPIO_Init(GPIOD, &GPIO_InitStructure);
 }
 
 void USART1_Init(void)
@@ -238,6 +249,9 @@ int main(void)
     // 영점 잡기 (Tare)
     HX711_Tare();
 
+	/* [추가] 불꽃 감지 상태 변수 */
+    //uint8_t flame_detected = 0;
+
     while (1)
     {
         // 10회 평균 측정
@@ -245,6 +259,22 @@ int main(void)
 
         // 무게 계산
         weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
+
+		// 2. [추가] 불꽃 감지 센서 읽기 (PD3)
+        // 센서가 불꽃 감지 시 Low(0)를 출력한다고 가정
+        if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) 
+        {
+            if (flame_detected == 0) // 상태가 변했을 때만 출력 (도배 방지)
+            {
+                // PC 시리얼 모니터나 블루투스로 경고 메시지 전송 (구현 필요 시)
+                // 예: printf("FIRE DETECTED!\r\n");
+                flame_detected = 1; 
+            }
+        }
+        else 
+        {
+            flame_detected = 0; // 불꽃이 사라지면 상태 초기화
+        }
 
         Delay_ms(200);
     }
