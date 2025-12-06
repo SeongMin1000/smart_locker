@@ -2,74 +2,84 @@ package com.example.embedded_term_application
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.*
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothSocket
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.location.LocationManager
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Message
 import android.util.Log
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.example.embedded_term_application.R
+import java.io.IOException
+import java.io.InputStream
+import java.text.SimpleDateFormat
+import java.util.*
+import kotlin.collections.ArrayList
 
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        const val MESSAGE_READ = 0
+    }
+
     private lateinit var btnBluetoothConnect: Button
     private lateinit var tvStatusText: TextView
-    private lateinit var btnLock: Button
+
+    // 센서 UI
+    private lateinit var tvValTemp: TextView
+    private lateinit var tvValPressure: TextView
+    private lateinit var tvValFlame: TextView
+
+    // 로그 UI
+    private lateinit var tvLogResult: TextView
+    private lateinit var svLogContainer: ScrollView
 
     private var bluetoothAdapter: BluetoothAdapter? = null
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var isScanning = false
-    private val handler = Handler(Looper.getMainLooper())
+    private var connectThread: ConnectThread? = null
+    private var connectedThread: ConnectedThread? = null
 
-    private var targetDeviceName: String? = null
-    private lateinit var prefs: SharedPreferences
-
-    // 스캔 결과 리스트
     private val scanResultList = ArrayList<BluetoothDevice>()
     private val scanResultStrings = ArrayList<String>()
     private lateinit var listAdapter: ArrayAdapter<String>
     private var scanDialog: AlertDialog? = null
 
-    // Classic 스캔 리시버 등록 여부
-    private var isReceiverRegistered = false
+    // 로그 및 상태 감지용 변수
+    private var prevPressure = -1
+    private var prevFlame = -1
 
-    // 권한 요청
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (permissions.values.all { it }) {
-            processScanAction()
+            startDiscovery()
         } else {
-            Toast.makeText(this, "권한이 거부되었습니다. 설정에서 권한을 허용해주세요.", Toast.LENGTH_LONG).show()
+            addLog("⚠권한이 거부되어 장치를 찾을 수 없습니다.")
         }
     }
 
-    // Classic 블루투스 검색 결과 수신 리시버
-    private val classicScanReceiver = object : BroadcastReceiver() {
+    private val receiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
         override fun onReceive(context: Context, intent: Intent) {
-            val action = intent.action
+            val action: String? = intent.action
             if (BluetoothDevice.ACTION_FOUND == action) {
-                // 장치 발견!
                 val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= 33) {
                     intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                 } else {
@@ -78,10 +88,13 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 device?.let {
-                    val name = it.name
-                    val addr = it.address
-                    // 이름이 없거나 주소만 있는 경우도 일단 다 추가 (디버깅 위해)
-                    addDeviceToList(it, 0)
+                    val address = it.address
+                    if (scanResultList.none { d -> d.address == address }) {
+                        scanResultList.add(it)
+                        val name = it.name ?: "Unknown"
+                        scanResultStrings.add("$name\n$address")
+                        listAdapter.notifyDataSetChanged()
+                    }
                 }
             }
         }
@@ -91,68 +104,113 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        prefs = getSharedPreferences("BleAppPrefs", Context.MODE_PRIVATE)
-        targetDeviceName = prefs.getString("TARGET_NAME", null)
-
-        initViews()
-
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
 
+        initViews()
+        setUiDisconnectedState()
+
         btnBluetoothConnect.setOnClickListener {
-            if (bluetoothGatt != null) {
-                disconnectGatt()
+            if (connectedThread != null) {
+                stopConnection()
             } else {
                 checkPermissionsAndScan()
             }
         }
 
-        // 롱클릭 시 초기화
-        btnBluetoothConnect.setOnLongClickListener {
-            targetDeviceName = null
-            prefs.edit().remove("TARGET_NAME").apply()
-            Toast.makeText(this, "초기화됨", Toast.LENGTH_SHORT).show()
-            true
-        }
+        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
+        registerReceiver(receiver, filter)
+
+        addLog("앱이 시작되었습니다. (대기 중)")
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        stopAllScan()
+        stopConnection()
+        try { unregisterReceiver(receiver) } catch (e: IllegalArgumentException) {}
     }
 
     private fun initViews() {
         btnBluetoothConnect = findViewById(R.id.btnBluetoothConnect)
         tvStatusText = findViewById(R.id.tvStatusText)
-        btnLock = findViewById(R.id.btnLock)
         listAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, scanResultStrings)
+
+        tvLogResult = findViewById(R.id.tvLogResult)
+        svLogContainer = findViewById(R.id.svLogContainer)
+
+        val cardTemp = findViewById<View>(R.id.cardTemp)
+        cardTemp.findViewById<TextView>(R.id.tvSensorLabel).text = "Temperature"
+        tvValTemp = cardTemp.findViewById(R.id.tvSensorValue)
+
+        val cardPressure = findViewById<View>(R.id.cardPressure)
+        cardPressure.findViewById<TextView>(R.id.tvSensorLabel).text = "Pressure"
+        tvValPressure = cardPressure.findViewById(R.id.tvSensorValue)
+
+        val cardFlame = findViewById<View>(R.id.cardFlame)
+        cardFlame.findViewById<TextView>(R.id.tvSensorLabel).text = "Flame"
+        tvValFlame = cardFlame.findViewById(R.id.tvSensorValue)
+    }
+
+    private fun setUiDisconnectedState() {
+        runOnUiThread {
+            val grayColor = Color.GRAY
+            tvValTemp.text = "-"
+            tvValTemp.setTextColor(grayColor)
+            tvValPressure.text = "-"
+            tvValPressure.setTextColor(grayColor)
+            tvValFlame.text = "-"
+            tvValFlame.setTextColor(grayColor)
+
+            tvStatusText.text = "DISCONNECTED"
+            tvStatusText.setTextColor(Color.GRAY)
+            btnBluetoothConnect.text = "장치 찾기"
+        }
+    }
+
+    private fun setUiConnectedState() {
+        runOnUiThread {
+            val noneColor = Color.RED
+            val noneText = "NONE"
+
+            tvValTemp.text = noneText
+            tvValTemp.setTextColor(noneColor)
+
+            tvValPressure.text = noneText
+            tvValPressure.setTextColor(noneColor)
+
+            tvValFlame.text = noneText
+            tvValFlame.setTextColor(noneColor)
+
+            tvStatusText.text = "CONNECTED"
+            tvStatusText.setTextColor(Color.GREEN)
+            btnBluetoothConnect.text = "연결 해제"
+        }
+    }
+
+    // 로그를 UI에 출력하는 함수 (Toast 대체)
+    private fun addLog(message: String) {
+        runOnUiThread {
+            val currentTime = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+            val logMessage = "[$currentTime] $message\n"
+            tvLogResult.append(logMessage)
+            // 자동 스크롤
+            svLogContainer.post {
+                svLogContainer.fullScroll(View.FOCUS_DOWN)
+            }
+        }
     }
 
     private fun checkPermissionsAndScan() {
-        // 1. GPS 켜짐 확인 (가장 중요)
-        val locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            Toast.makeText(this, "⚠️ 중요: 스캔을 위해 GPS를 켜주세요!", Toast.LENGTH_LONG).show()
-            // 위치 설정 화면으로 보낼 수도 있음 (선택사항)
-            return
-        }
-
-        // 2. 권한 목록 구성
         val permissions = mutableListOf<String>()
-
-        // 위치 권한은 버전에 상관없이 필수로 넣습니다 (Classic 스캔 때문)
-        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
-        permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION)
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             permissions.add(Manifest.permission.BLUETOOTH_SCAN)
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
         } else {
             permissions.add(Manifest.permission.BLUETOOTH)
             permissions.add(Manifest.permission.BLUETOOTH_ADMIN)
+            permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
 
-        // 3. 권한 체크
         val notGranted = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
@@ -160,183 +218,222 @@ class MainActivity : AppCompatActivity() {
         if (notGranted.isNotEmpty()) {
             requestPermissionLauncher.launch(notGranted.toTypedArray())
         } else {
-            processScanAction()
+            startDiscovery()
         }
-    }
-
-    private fun processScanAction() {
-        if (targetDeviceName != null) {
-            Toast.makeText(this, "등록된 장치($targetDeviceName) 연결 시도", Toast.LENGTH_SHORT).show()
-            startAllScan(true) // 자동 연결 모드
-        } else {
-            showDeviceScanDialog()
-            startAllScan(false) // 목록 모드
-        }
-    }
-
-    private fun showDeviceScanDialog() {
-        scanResultList.clear()
-        scanResultStrings.clear()
-        listAdapter.notifyDataSetChanged()
-
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("장치 선택 (검색중...)")
-        builder.setAdapter(listAdapter) { _, which ->
-            stopAllScan()
-            connectToDevice(scanResultList[which])
-        }
-        builder.setNegativeButton("취소") { dialog, _ ->
-            stopAllScan()
-            dialog.dismiss()
-        }
-        builder.setOnCancelListener { stopAllScan() }
-
-        scanDialog = builder.create()
-        scanDialog?.show()
     }
 
     @SuppressLint("MissingPermission")
-    private fun startAllScan(isAuto: Boolean) {
-        if (isScanning) return
-        isScanning = true
-        btnBluetoothConnect.text = "검색 중..."
+    private fun startDiscovery() {
+        scanResultList.clear()
+        scanResultStrings.clear()
 
-        // 1. Classic 블루투스 스캔 시작 (BroadcastReceiver)
-        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
-        registerReceiver(classicScanReceiver, filter)
-        isReceiverRegistered = true
+        val pairedDevices: Set<BluetoothDevice>? = bluetoothAdapter?.bondedDevices
+        if (!pairedDevices.isNullOrEmpty()) {
+            for (device in pairedDevices) {
+                scanResultList.add(device)
+                val name = device.name ?: "Unknown"
+                scanResultStrings.add("[저장됨] $name\n${device.address}")
+            }
+        }
+        listAdapter.notifyDataSetChanged()
 
         if (bluetoothAdapter?.isDiscovering == true) {
             bluetoothAdapter?.cancelDiscovery()
         }
         bluetoothAdapter?.startDiscovery()
-        Log.d("BT_TAG", "Classic Discovery Started")
 
-        // 2. BLE 스캔 시작
-        val scanSettings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-        bluetoothAdapter?.bluetoothLeScanner?.startScan(null, scanSettings, bleScanCallback)
-        Log.d("BT_TAG", "BLE Scan Started")
-
-        // 15초 후 중지
-        handler.postDelayed({
-            if (isScanning) {
-                stopAllScan()
-                if (!isAuto) {
-                    Toast.makeText(this, "검색 종료. (${scanResultList.size}개 발견)", Toast.LENGTH_SHORT).show()
-                    scanDialog?.setTitle("장치 선택 (완료)")
-                }
+        if (scanDialog == null || !scanDialog!!.isShowing) {
+            val builder = AlertDialog.Builder(this)
+            builder.setTitle("장치 선택")
+            builder.setAdapter(listAdapter) { _, which ->
+                bluetoothAdapter?.cancelDiscovery()
+                connectToDevice(scanResultList[which])
             }
-        }, 15000)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun stopAllScan() {
-        if (!isScanning) return
-        isScanning = false
-        btnBluetoothConnect.text = "BT 연결"
-
-        // BLE 중지
-        bluetoothAdapter?.bluetoothLeScanner?.stopScan(bleScanCallback)
-
-        // Classic 중지
-        bluetoothAdapter?.cancelDiscovery()
-
-        // 리시버 해제
-        if (isReceiverRegistered) {
-            try {
-                unregisterReceiver(classicScanReceiver)
-            } catch (e: Exception) {
-                e.printStackTrace()
+            builder.setNegativeButton("취소") { dialog, _ ->
+                bluetoothAdapter?.cancelDiscovery()
+                dialog.dismiss()
             }
-            isReceiverRegistered = false
-        }
-    }
-
-    // BLE 콜백
-    private val bleScanCallback = object : ScanCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            addDeviceToList(result.device, result.rssi)
-        }
-        override fun onScanFailed(errorCode: Int) {
-            Log.e("BT_TAG", "BLE Scan Failed: $errorCode")
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun addDeviceToList(device: BluetoothDevice, rssi: Int) {
-        val name = device.name ?: "Unknown"
-        val addr = device.address
-
-        // UI 스레드에서 작업
-        runOnUiThread {
-            // 자동 연결 모드면 타겟 찾기
-            if (targetDeviceName != null) {
-                if (name == targetDeviceName) {
-                    stopAllScan()
-                    connectToDevice(device)
-                }
-                return@runOnUiThread
-            }
-
-            // 중복 방지 및 추가
-            if (scanResultList.none { it.address == addr }) {
-                scanResultList.add(device)
-
-                // 표시 텍스트 구성
-                val rssiStr = if (rssi != 0) "Signal: $rssi" else ""
-                val displayText = if (name == "Unknown") {
-                    "[$addr]\n$rssiStr" // 이름 없으면 주소 강조
-                } else {
-                    "$name\n$addr $rssiStr"
-                }
-
-                scanResultStrings.add(displayText)
-                listAdapter.notifyDataSetChanged()
-            }
+            scanDialog = builder.create()
+            scanDialog?.show()
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun connectToDevice(device: BluetoothDevice) {
-        scanDialog?.dismiss()
-        Toast.makeText(this, "연결 시도: ${device.name}", Toast.LENGTH_SHORT).show()
+        // Toast 대신 로그 사용
+        addLog("연결 시도 중... (${device.name})")
 
-        // BLE 연결 시도
-        bluetoothGatt = device.connectGatt(this, false, gattCallback)
+        connectThread?.cancel()
+        connectedThread?.cancel()
+
+        connectThread = ConnectThread(device)
+        connectThread?.start()
     }
 
     @SuppressLint("MissingPermission")
-    private fun disconnectGatt() {
-        bluetoothGatt?.disconnect()
-        bluetoothGatt?.close()
-        bluetoothGatt = null
-        btnBluetoothConnect.text = "BT 연결"
-        Toast.makeText(this, "연결 해제됨", Toast.LENGTH_SHORT).show()
+    private inner class ConnectThread(private val device: BluetoothDevice) : Thread() {
+        private val mmSocket: BluetoothSocket? by lazy(LazyThreadSafetyMode.NONE) {
+            device.createRfcommSocketToServiceRecord(SPP_UUID)
+        }
+
+        override fun run() {
+            bluetoothAdapter?.cancelDiscovery()
+
+            try {
+                mmSocket?.connect()
+            } catch (e: IOException) {
+                Log.e("BT_TAG", "Socket connect failed", e)
+                // Toast 삭제 -> 로그로 대체
+                addLog("연결 실패: ${e.message}")
+                cancel()
+                return
+            }
+
+            mmSocket?.let { manageMyConnectedSocket(it) }
+        }
+
+        fun cancel() {
+            try { mmSocket?.close() } catch (e: IOException) { }
+        }
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            runOnUiThread {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    val name = gatt.device.name ?: "Unknown"
-                    Toast.makeText(applicationContext, "연결 성공! ($name)", Toast.LENGTH_LONG).show()
-                    btnBluetoothConnect.text = "연결 해제"
+    private fun manageMyConnectedSocket(socket: BluetoothSocket) {
+        connectedThread = ConnectedThread(socket)
+        connectedThread?.start()
 
-                    // 이름 저장
-                    if (targetDeviceName == null) {
-                        prefs.edit().putString("TARGET_NAME", name).apply()
-                        targetDeviceName = name
+        runOnUiThread {
+            setUiConnectedState()
+            // Toast 삭제
+        }
+        // 로그로 연결 성공 알림
+        addLog("연결 성공! 데이터 수신 대기 중...")
+
+        prevPressure = -1
+        prevFlame = -1
+    }
+
+    private inner class ConnectedThread(private val socket: BluetoothSocket) : Thread() {
+        private val mmInStream: InputStream = socket.inputStream
+        private val mmBuffer: ByteArray = ByteArray(1024)
+
+        override fun run() {
+            var numBytes: Int
+            val stringBuilder = StringBuilder()
+
+            while (true) {
+                try {
+                    numBytes = mmInStream.read(mmBuffer)
+                    val readMessage = String(mmBuffer, 0, numBytes)
+                    stringBuilder.append(readMessage)
+
+                    val endOfLineIndex = stringBuilder.indexOf("\n")
+                    if (endOfLineIndex > 0) {
+                        val completeData = stringBuilder.substring(0, endOfLineIndex).trim()
+                        stringBuilder.delete(0, endOfLineIndex + 1)
+                        mHandler.obtainMessage(MESSAGE_READ, completeData).sendToTarget()
                     }
-                    gatt.discoverServices()
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    Toast.makeText(applicationContext, "연결 끊김", Toast.LENGTH_SHORT).show()
-                    btnBluetoothConnect.text = "BT 연결"
+                } catch (e: IOException) {
+                    // 연결 끊김 발생 시
+                    addLog("연결이 종료되었습니다.")
+                    runOnUiThread {
+                        stopConnection()
+                    }
+                    break
                 }
             }
+        }
+
+        fun cancel() {
+            try { socket.close() } catch (e: IOException) { }
+        }
+    }
+
+    private fun stopConnection() {
+        connectThread?.cancel()
+        connectedThread?.cancel()
+        connectThread = null
+        connectedThread = null
+
+        setUiDisconnectedState()
+        // 여기서도 로그 남기기 (중복 호출 방지를 위해 필요시 조정 가능)
+        // addLog("연결 종료 처리됨")
+    }
+
+    private val mHandler = object : Handler(Looper.getMainLooper()) {
+        override fun handleMessage(msg: Message) {
+            if (msg.what == MESSAGE_READ) {
+                val readMessage = msg.obj as String
+                parseAndDisplay(readMessage)
+            }
+        }
+    }
+
+    // =========================================================================
+    // 데이터 파싱 및 로그 로직
+    // =========================================================================
+    private fun parseAndDisplay(data: String) {
+        if (data.isEmpty()) return
+
+        try {
+            val parts = data.split("/")
+
+            val validColor = Color.BLACK
+            val alertColor = Color.RED
+
+            for (part in parts) {
+                val keyValue = part.split(":")
+                if (keyValue.size == 2) {
+                    val key = keyValue[0].trim().uppercase()
+                    val valueStr = keyValue[1].trim()
+
+                    if (valueStr.isEmpty()) continue
+
+                    when (key) {
+                        "TEMP" -> {
+                            tvValTemp.text = "$valueStr °C"
+                            tvValTemp.setTextColor(validColor)
+                        }
+                        "PRES" -> {
+                            tvValPressure.text = valueStr
+                            tvValPressure.setTextColor(validColor)
+
+                            val currentPres = valueStr.toIntOrNull() ?: 0
+                            if (prevPressure != -1) {
+                                if (prevPressure > 50 && currentPres < 10) {
+                                    addLog("⚠[도난 경보] 물건 제거 감지됨!")
+                                }
+                                if (prevPressure < 10 && currentPres > 50) {
+                                    addLog("[보관 감지] 물건 보관됨.")
+                                }
+                            }
+                            prevPressure = currentPres
+                        }
+                        "FLAME" -> {
+                            val currentFlame = valueStr.toIntOrNull() ?: 0
+
+                            if (currentFlame == 1) {
+                                tvValFlame.text = "DETECTED"
+                                tvValFlame.setTextColor(alertColor)
+
+                                if (prevFlame != 1) {
+                                    addLog("[화재 경보] 불꽃 감지됨!")
+                                }
+                            } else {
+                                tvValFlame.text = "SAFE"
+                                tvValFlame.setTextColor(Color.GREEN)
+
+                                if (prevFlame == 1) {
+                                    addLog("[화재 해제] 상태 안전.")
+                                }
+                            }
+                            prevFlame = currentFlame
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // 파싱 에러도 로그에 남기기 (디버깅용)
+            // addLog("데이터 형식 오류: $data")
         }
     }
 }
