@@ -9,18 +9,24 @@
 /* ================================================================
  * [사용자 설정] HX711 핀 & 보정 계수
  * ================================================================ */
-
-
-// 예: 현재 400.0f -> (400 * 측정된값 / 실제무게)로 수정 필요
 float Calibration_Factor = 400.0f; 
 long Zero_Offset = 0;
 
-/* 전역 변수 (디버깅 확인용) */
+/* ================================================================
+ * 전역 변수 (디버깅 확인용)
+ * ================================================================ */
+// 1. 로드셀 관련
 volatile float weight = 0.0f;
 volatile long raw_data = 0;
 
-// 불꽃 감지 상태 확인용 변수
-volatile uint8_t flame_detected = 0;
+// 2. 불꽃 감지 센서 상태 (0: 정상, 1: 화재감지)
+volatile uint8_t flame_detected = 0; 
+
+// 3. [NEW] 리드 스위치 (문) 상태
+// 0: 닫힘(자석 붙음), 1: 열림(자석 떨어짐)
+volatile uint8_t g_IsDoorOpen = 0;
+// 문 열린 횟수 카운트
+volatile uint32_t g_DoorOpenCount = 0;
 
 /* function prototype */
 void RCC_Configure(void);
@@ -47,6 +53,9 @@ void RCC_Configure(void)
 
 	/* HX711 clock enable*/
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE); // DATA - PB6, SCK - PB6
+
+	/* 리드 스위치 clock enable*/
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
 
 	/* USART1, USART2 clock enable */
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE); // USART1은 APB2
@@ -103,6 +112,11 @@ void GPIO_Configure(void)
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU; // 풀업 입력 설정
     GPIO_Init(GPIOD, &GPIO_InitStructure);
+
+	/* 5. [NEW] 리드 스위치 (PC3) - 문 감지 */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU; // 내부 풀업 사용
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
 }
 
 void USART1_Init(void)
@@ -236,46 +250,68 @@ int main(void)
     SystemInit();
     RCC_Configure();
     GPIO_Configure();
-    USART1_Init();      // pc
-    USART2_Init();      // bluetooth
+    USART1_Init();      
+    USART2_Init();      
     NVIC_Configure();
 
-    // HX711 초기 상태 설정 (SCK Low)
+    // HX711 초기화
     HX711_Init_State();
-
-    // 안정화 대기 (전원 인가 후 센서 안정화)
     Delay_ms(2000);
-
-    // 영점 잡기 (Tare)
     HX711_Tare();
 
-	/* [추가] 불꽃 감지 상태 변수 */
-    //uint8_t flame_detected = 0;
+    /* 리드 스위치 상태 관리용 변수 (지역) */
+    uint8_t lastDoorState = 0;
+    
+    // 초기 문 상태 읽기
+    lastDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
 
     while (1)
     {
-        // 10회 평균 측정
+        /* -------------------------------------------
+         * 1. 로드셀 (무게 측정)
+         * ------------------------------------------- */
         raw_data = HX711_Read_Average(10);
-
-        // 무게 계산
         weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
-
-		// 2. [추가] 불꽃 감지 센서 읽기 (PD3)
-        // 센서가 불꽃 감지 시 Low(0)를 출력한다고 가정
-        if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) 
-        {
-            if (flame_detected == 0) // 상태가 변했을 때만 출력 (도배 방지)
-            {
-                // PC 시리얼 모니터나 블루투스로 경고 메시지 전송 (구현 필요 시)
-                // 예: printf("FIRE DETECTED!\r\n");
-                flame_detected = 1; 
+        
+        /* -------------------------------------------
+         * 2. 불꽃 감지 센서 (PD3)
+         * ------------------------------------------- */
+        if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) {
+            if (flame_detected == 0) {
+                 // 화재 감지 시 동작 (필요 시 UART 전송 코드 추가)
+                 flame_detected = 1; 
             }
-        }
-        else 
-        {
-            flame_detected = 0; // 불꽃이 사라지면 상태 초기화
+        } else {
+            flame_detected = 0;
         }
 
+        /* -------------------------------------------
+         * 3. [NEW] 리드 스위치 (문 감지) (PC3)
+         * ------------------------------------------- */
+        // 현재 상태 읽기
+        uint8_t currentDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
+        
+        // 전역 변수 업데이트 (디버깅용)
+        g_IsDoorOpen = currentDoorState;
+
+        // 문이 열림 감지 (0 -> 1 : Rising Edge)
+        // 닫혀있음(0) -> 열림(1)
+        if (lastDoorState == 0 && currentDoorState == 1)
+        {
+            g_DoorOpenCount++; // 카운트 증가
+            Delay_ms(50);      // 바운싱 방지 (떨림 제거)
+        }
+        // 문이 닫힘 감지 (1 -> 0 : Falling Edge)
+        else if (lastDoorState == 1 && currentDoorState == 0)
+        {
+            Delay_ms(50);      // 바운싱 방지
+        }
+        
+        // 상태 업데이트
+        lastDoorState = currentDoorState;
+
+        /* 루프 딜레이 */
+        // 기존 200ms 딜레이 유지 (센서 측정 주기)
         Delay_ms(200);
     }
 }
