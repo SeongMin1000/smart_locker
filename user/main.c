@@ -28,6 +28,10 @@ volatile uint8_t g_IsDoorOpen = 0;
 // 문 열린 횟수 카운트
 volatile uint32_t g_DoorOpenCount = 0;
 
+// 4. 온습도 센서
+volatile uint32_t g_Temperature = 0;
+volatile uint32_t g_Humidity = 0;
+
 /* function prototype */
 void RCC_Configure(void);
 void GPIO_Configure(void);
@@ -42,6 +46,12 @@ long HX711_Read_Average(unsigned char times);
 void HX711_Tare(void);
 void Delay_us(uint32_t us);
 void Delay_ms(uint32_t ms);
+
+/* DHT11 관련 함수 */
+void DHT11_GPIO_Output(void);
+void DHT11_GPIO_Input(void);
+uint8_t DHT11_Read_Data(uint8_t *temp, uint8_t *humi);
+void DHT11_Delay_us(uint32_t us);
 
 
 // 주변장치 클럭 부여
@@ -243,6 +253,82 @@ void Delay_us(uint32_t us) { us *= 12; while(us--); }
 void Delay_ms(uint32_t ms) { while(ms--) Delay_us(1000); }
 
 /* ================================================================
+ * [추가] DHT11 드라이버 함수 구현 (PC2 사용)
+ * ================================================================ */
+
+// DHT11 전용 미세 딜레이 (기존 Delay_us와 다르게 튜닝됨)
+void DHT11_Delay_us(uint32_t us)
+{
+    us *= 8; 
+    while(us--) { __NOP(); }
+}
+
+void DHT11_GPIO_Output(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2; // PC2
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+}
+
+void DHT11_GPIO_Input(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2; // PC2
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING; 
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+}
+
+uint8_t DHT11_Read_Data(uint8_t *temp, uint8_t *humi)
+{
+    uint8_t data[5] = {0, 0, 0, 0, 0};
+    uint8_t i, j;
+
+    // 1. Start Signal
+    DHT11_GPIO_Output();
+    GPIO_ResetBits(GPIOC, GPIO_Pin_2);
+    Delay_ms(20); // 18ms 이상 Low
+    GPIO_SetBits(GPIOC, GPIO_Pin_2);
+    DHT11_Delay_us(30);
+
+    // 2. Check Response
+    DHT11_GPIO_Input();
+    DHT11_Delay_us(10);
+    if (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_2) == 1) return 0; // 응답 없음
+    
+    while(GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_2) == 0); // Low 대기
+    while(GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_2) == 1); // High 대기
+
+    // 3. Data Read (40 bits)
+    for (i = 0; i < 5; i++)
+    {
+        for (j = 0; j < 8; j++)
+        {
+            while(GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_2) == 0); // Low 대기
+
+            DHT11_Delay_us(40); // 40us 후 High인지 확인
+
+            if (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_2) == 1)
+            {
+                data[i] |= (1 << (7 - j));
+                while(GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_2) == 1); // 남은 High 대기
+            }
+        }
+    }
+
+    // 4. Checksum
+    if ((data[0] + data[1] + data[2] + data[3]) == data[4])
+    {
+        *humi = data[0];
+        *temp = data[2];
+        return 1;
+    }
+    return 0;
+}
+
+/* ================================================================
  * 메인 함수
  * ================================================================ */
 int main(void)
@@ -261,6 +347,8 @@ int main(void)
 
     /* 리드 스위치 상태 관리용 변수 (지역) */
     uint8_t lastDoorState = 0;
+	/* [추가] 온습도 센서 타이머용 변수 */
+    int dht_timer = 0;
     
     // 초기 문 상태 읽기
     lastDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
@@ -310,8 +398,27 @@ int main(void)
         // 상태 업데이트
         lastDoorState = currentDoorState;
 
+		/* -------------------------------------------
+         * 4. 온습도 센서
+         * ------------------------------------------- */
+		dht_timer++; // 루프 돌 때마다 카운트 증가
+
+        // 루프 딜레이가 10ms이므로, 200번 돌면 약 2초 (10ms * 200 = 2000ms)
+        if (dht_timer >= 200) 
+        {
+            dht_timer = 0; // 카운터 초기화
+            
+            uint8_t t = 0, h = 0;
+            // DHT11 읽기 시도 (PC2 핀)
+            if (DHT11_Read_Data(&t, &h) == 1)
+            {
+                g_Temperature = t;
+                g_Humidity = h;
+            }
+            // 실패하면 이전 값 유지 (혹은 에러처리)
+        }
+
         /* 루프 딜레이 */
-        // 기존 200ms 딜레이 유지 (센서 측정 주기)
-        Delay_ms(200);
+        Delay_ms(10);
     }
 }
