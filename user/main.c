@@ -11,15 +11,9 @@
 #include "misc.h"
 
 /* ================================================================
- * [사용자 설정] HX711 핀 & 보정 계수
+ * UART2(블루투스) 관련 변수
  * ================================================================ */
-float Calibration_Factor = 400.0f; 
-long Zero_Offset = 0;
-
-/* ================================================================
- * [추가] UART2(블루투스) 관련 변수
- * ================================================================ */
-#define MAX_RX_BUF 100
+#define MAX_RX_BUF 64
 volatile char g_bt_rx_buffer[MAX_RX_BUF]; // 수신 버퍼
 volatile uint8_t g_bt_rx_index = 0;       // 버퍼 인덱스
 volatile uint8_t g_bt_data_ready = 0;     // 수신 완료 플래그 (1이면 데이터 있음)
@@ -27,27 +21,20 @@ volatile uint8_t g_bt_data_ready = 0;     // 수신 완료 플래그 (1이면 �
 /* ================================================================
  * 전역 변수
  * ================================================================ */
-// 1. 로드셀 관련
-volatile float weight = 0.0f;
-volatile long raw_data = 0;
 
-// 2. 불꽃 감지 센서 상태 (0: 정상, 1: 화재감지)
-volatile uint8_t flame_detected = 0; 
+// 상태 관리용 enum
+typedef enum {
+    STATE_UNLOCKED = 0,
+    STATE_LOCKED = 1
+} SafeState;
+SafeState current_state = STATE_UNLOCKED;
 
-// 3. 리드 스위치 (문) 상태
-volatile uint8_t g_IsDoorOpen = 0;
-volatile uint32_t g_DoorOpenCount = 0;
+// 로드셀 관련 변수
+long reference_weight = 0; // 잠금 시점의 무게 (물건 있음)
+long current_weight = 0;   // 실시간 무게
+const long EMPTY_WEIGHT = 826000; // 아무것도 없을 때의 기본값 (보정 필요)
+const long THRESHOLD = 10000;      // 오차 범위 (센서 노이즈 감안)
 
-// 4. 온습도 센서
-volatile uint32_t g_Temperature = 0;
-volatile uint32_t g_Humidity = 0;
-
-// 5. 진동 센서
-volatile uint32_t g_VibrationCount = 0;   
-volatile uint8_t  g_VibrationDetected = 0; 
-
-// 6. [NEW] 서보모터 동작 테스트용 변수
-int servo_test_timer = 0;
 uint8_t servo_state = 0; // 0: 닫힘, 1: 열림
 
 /* function prototype */
@@ -164,7 +151,7 @@ void GPIO_Configure(void)
     GPIO_Init(GPIOC, &GPIO_InitStructure);
 }
 
-/* [추가] TIM3 설정 함수 (PWM for Servo) */
+/* TIM3 설정 함수 (PWM for Servo) */
 void TIM_Configure(void)
 {
     TIM_TimeBaseInitTypeDef TIM3_InitStructure;
@@ -244,7 +231,7 @@ void NVIC_Configure(void) {
 }
 
 /* ================================================================
- * [추가] 서보모터 각도 조절 함수 (Pulse 폭으로 제어)
+ * 서보모터 각도 조절 함수 (Pulse 폭으로 제어)
  * pulse: 500(0도) ~ 1500(90도) ~ 2500(180도)
  * ================================================================ */
 void Servo_Write(uint16_t pulse) {
@@ -262,12 +249,14 @@ void HX711_Init_State(void)
     GPIO_ResetBits(GPIOB, GPIO_Pin_6); 
     Delay_ms(10);
 }
+
 long HX711_Read(void)
 {
     long count = 0;
     unsigned char i;
+
     GPIO_ResetBits(GPIOB, GPIO_Pin_6);
-    while(GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_7)); 
+    
     __disable_irq(); 
     for (i = 0; i < 24; i++)
     {
@@ -283,6 +272,7 @@ long HX711_Read(void)
     GPIO_ResetBits(GPIOB, GPIO_Pin_6);
     Delay_us(1);
     __enable_irq(); 
+    
     count = count ^ 0x800000; 
     return count;
 }
@@ -292,9 +282,7 @@ long HX711_Read_Average(unsigned char times)
     for (unsigned char i = 0; i < times; i++) sum += HX711_Read();
     return sum / times;
 }
-void HX711_Tare(void) { Zero_Offset = HX711_Read_Average(30); }
-void Delay_us(uint32_t us) { us *= 12; while(us--); }
-void Delay_ms(uint32_t ms) { while(ms--) Delay_us(1000); }
+void HX711_Tare(void) { HX711_Read_Average(30); }
 
 /* DHT11 드라이버 함수 구현 */
 void DHT11_Delay_us(uint32_t us) { us *= 8; while(us--) { __NOP(); } }
@@ -405,28 +393,32 @@ void Process_Bluetooth_Command(void)
         {
             Servo_Write(2400); // 서보모터 열림 각도 (값은 캘리브레이션 필요)
             servo_state = 1;   // 상태 변수 업데이트
-            USART2_SendString("OK: Door Unlocked\r\n"); // 폰으로 응답 전송
+            //USART2_SendString("OK: Door Unlocked\r\n"); // 폰으로 응답 전송
         }
         // 2. 잠금 명령 (CMD: LOCK)
         else if (strcmp((char*)g_bt_rx_buffer, "CMD: LOCK") == 0)
         {
             Servo_Write(1500); // 서보모터 닫힘 각도 (값은 캘리브레이션 필요)
             servo_state = 0;   // 상태 변수 업데이트
-            USART2_SendString("OK: Door Locked\r\n"); // 폰으로 응답 전송
+            //USART2_SendString("OK: Door Locked\r\n"); // 폰으로 응답 전송
         }
         // 3. 알 수 없는 명령어
-        else 
-        {
-            // 디버깅용: 받은 이상한 명령어를 다시 보내봄
-            char msg[80];
-            sprintf(msg, "ERROR: Unknown Command [%s]\r\n", g_bt_rx_buffer);
-            USART2_SendString(msg);
-        }
+        //else 
+        // {
+        //     // 디버깅용: 받은 이상한 명령어를 다시 보내봄
+        //     char msg[80];
+        //     //sprintf(msg, "ERROR: Unknown Command [%s]\r\n", g_bt_rx_buffer);
+        //     USART2_SendString(msg);
+        // }
         
         // 버퍼 초기화 (잔여 데이터 방지)
         memset((void*)g_bt_rx_buffer, 0, MAX_RX_BUF);
     }
 }
+
+/* 딜레이 함수 */
+void Delay_us(uint32_t us) { us *= 12; while(us--); }
+void Delay_ms(uint32_t ms) { while(ms--) Delay_us(1000); }
 
 /* ================================================================
  * 메인 함수
@@ -439,8 +431,6 @@ int main(void)
     USART1_Init();      
     USART2_Init();      
     NVIC_Configure();
-
-    // [추가] 서보모터용 PWM 타이머 설정
     TIM_Configure();
 
     // HX711 초기화
@@ -448,7 +438,7 @@ int main(void)
     Delay_ms(2000);
     HX711_Tare();
 
-    /* 리드 스위치 상태 관리용 변수 (지역) */
+    /* 리드 스위치 상태 관리용 변수 */
     uint8_t lastDoorState = 0;
     /* 온습도 센서 타이머용 변수 */
     int dht_timer = 0;
@@ -458,80 +448,74 @@ int main(void)
     lastVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
     lastDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
 
-    // 초기 서보 위치 (닫힘: 1500)
-    Servo_Write(1500); 
+    // 초기 상태: 잠금 해제, 모터 0도(열림)
+    Servo_Write(1500); // 0도 (열림)
+    current_state = STATE_UNLOCKED;
 
     while (1)
     {
-        /* 1. 로드셀 (무게 측정) */
-        raw_data = HX711_Read_Average(10);
-        weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
+        // ---------------------------------------------------------
+        // 1. 블루투스 명령어 처리
+        // ---------------------------------------------------------
+        if (g_bt_data_ready)
+        {
+            g_bt_data_ready = 0; // 플래그 초기화
+
+            // [잠금 명령] CMD:LOCK
+            if (strcmp((char*)g_bt_rx_buffer, "CMD:LOCK") == 0)
+            {
+                // 1) 현재 무게를 측정해서 '기준값'으로 잡음 (물건이 들어있는 상태)
+                reference_weight = HX711_Read(); 
+                
+                // 2) 서보모터 잠금 (90도 회전)
+                Servo_Write(2400); // 90도 (잠금 위치, 값 조절 필요)
+                
+                // 3) 상태 변경
+                current_state = STATE_LOCKED;
+                
+                // 4) 앱에 확인 메시지 전송
+                char msg[64];
+                sprintf(msg, "OK: LOCKED (Weight: %ld)\r\n", reference_weight);
+                USART2_SendString(msg);
+            }
+            // [해제 명령] CMD:UNLOCK
+            else if (strcmp((char*)g_bt_rx_buffer, "CMD:UNLOCK") == 0)
+            {
+                Servo_Write(1500); // 0도 (열림 위치)
+                current_state = STATE_UNLOCKED;
+                USART2_SendString("OK: UNLOCKED\r\n");
+            }
+            
+            // 버퍼 초기화
+            memset((void*)g_bt_rx_buffer, 0, MAX_RX_BUF);
+        }
+
+        // ---------------------------------------------------------
+        // 2. 도난 감지 로직 (LOCKED 상태일 때만 동작)
+        // ---------------------------------------------------------
+        if (current_state == STATE_LOCKED)
+        {
+            current_weight = HX711_Read(); // 실시간 무게 측정
+
+            // 도난 판단 조건:
+            // (기준 무게보다 현저히 가벼워짐) OR (빈 통 무게(820000) 근처로 돌아감)
+            // reference_weight - current_weight > THRESHOLD : 기준보다 무게가 많이 빠짐
+            
+            if ((reference_weight - current_weight) > THRESHOLD)
+            {
+                // 도난 발생!!
+                USART2_SendString("WARNING: THEFT DETECTED!\r\n");
+                
+                // PC 터미널에도 디버깅 출력
+                // printf("THEFT! Ref: %ld, Curr: %ld\r\n", reference_weight, current_weight);
+                
+                // (선택사항) 너무 자주 보내지 않게 딜레이를 주거나,
+                // 한 번 보내고 상태를 바꾸는 등의 처리가 필요할 수 있음
+                Delay_ms(1000); 
+            }
+        }
         
-        /* 2. 불꽃 감지 센서 */
-        if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) {
-            if (flame_detected == 0) {
-                 flame_detected = 1; 
-                 // 화재 시 문 열기 (예시)
-                 // Servo_Write(2400); 
-            }
-        } else {
-            flame_detected = 0;
-        }
-
-        /* 3. 리드 스위치 (문 감지) */
-        uint8_t currentDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
-        g_IsDoorOpen = currentDoorState;
-
-        if (lastDoorState == 0 && currentDoorState == 1) {
-            g_DoorOpenCount++; 
-            Delay_ms(50);      
-        } else if (lastDoorState == 1 && currentDoorState == 0) {
-            Delay_ms(50);      
-        }
-        lastDoorState = currentDoorState;
-
-        /* 4. 온습도 센서 */
-        dht_timer++; 
-        if (dht_timer >= 200) {
-            dht_timer = 0; 
-            uint8_t t = 0, h = 0;
-            if (DHT11_Read_Data(&t, &h) == 1) {
-                g_Temperature = t;
-                g_Humidity = h;
-            }
-        }
-
-        /* 5. 진동 센서 */
-        uint8_t currentVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
-        g_VibrationDetected = currentVibState;
-
-        if (lastVibState == 0 && currentVibState == 1) {
-            g_VibrationCount++; 
-            Delay_ms(50); 
-        }
-        lastVibState = currentVibState;
-
-
-        /* =======================================================
-         * [NEW] 서보모터 동작 테스트 코드
-         * 2초(200 loop * 10ms)마다 열렸다 닫혔다 반복
-         * ======================================================= */
-        servo_test_timer++;
-        if (servo_test_timer > 200) { // 약 2초마다 실행
-            servo_test_timer = 0;
-            if (servo_state == 0) {
-                Servo_Write(2400); // 열림 (각도 조절 필요: 500~2500)
-                servo_state = 1;
-            } else {
-                Servo_Write(1500); // 닫힘
-                servo_state = 0;
-            }
-        }
-
-        // [추가] 블루투스 명령어 처리
-        Process_Bluetooth_Command();
-
-        /* 루프 딜레이 */
-        Delay_ms(10);
+        Delay_ms(100); // 루프 속도 조절
     }
+
 }
