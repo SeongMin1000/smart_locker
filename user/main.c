@@ -22,6 +22,11 @@ volatile uint8_t g_bt_data_ready = 0;     // 수신 완료 플래그 (1이면 �
 volatile uint8_t g_timer_sec_count = 0; // 초 카운트
 volatile uint8_t g_send_temp_flag = 1;  // 5초 전송 플래그
 
+uint8_t temp = 0;
+
+// [추가] 리드 스위치 상태 디버깅용 변수
+// 0: 닫힘(자석 붙음), 1: 열림(자석 떨어짐) - IPU 모드 기준
+volatile uint8_t g_door_debug_val = 0;
 /* ================================================================
  * 전역 변수
  * ================================================================ */
@@ -504,6 +509,9 @@ int main(void)
 
     while (1)
     {
+        // [추가] 매 루프마다 리드 스위치 상태를 전역 변수에 저장
+        // Bit_RESET(0) = 닫힘, Bit_SET(1) = 열림
+        g_door_debug_val = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
         // ---------------------------------------------------------
         // 1. 블루투스 명령어 처리
         // ---------------------------------------------------------
@@ -511,29 +519,54 @@ int main(void)
         {
             g_bt_data_ready = 0; // 플래그 초기화
 
-            // [잠금 명령] CMD:LOCK
+            // =========================================================
+            // [수정] 잠금 명령 (CMD:LOCK) - 리드 스위치 안전장치 추가
+            // =========================================================
             if (strcmp((char*)g_bt_rx_buffer, "CMD:LOCK") == 0)
             {
-                // 1) 현재 무게를 측정해서 '기준값'으로 잡음 (물건이 들어있는 상태)
-                reference_weight = HX711_Read(); 
-                
-                // 2) 서보모터 잠금 (90도 회전)
-                Servo_Write(2400); // 90도 (잠금 위치, 값 조절 필요)
-                
-                // 3) 상태 변경
-                current_state = STATE_LOCKED;
-                
-                // 4) 앱에 확인 메시지 전송
-                char msg[64];
-                sprintf(msg, "OK: LOCKED (Weight: %ld)\r\n", reference_weight);
-                USART2_SendString(msg);
+                // 1) 리드 스위치(PC3) 상태 확인
+                // IPU 모드이므로, 문이 닫히면(자석 붙음) Low(0), 열리면 High(1)입니다.
+                if (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3) == Bit_RESET)
+                {
+                    // --- 문이 닫혀있을 때만 잠금 수행 ---
+                    
+                    // 현재 무게를 기준값으로 설정
+                    reference_weight = HX711_Read(); 
+                    
+                    // 서보모터 잠금 (90도)
+                    Servo_Write(2400); 
+                    
+                    // 상태 변경
+                    current_state = STATE_LOCKED;
+                    
+                    // 성공 메시지 전송
+                    char msg[64];
+                    sprintf(msg, "OK: LOCKED (Ref Weight: %ld)\r\n", reference_weight);
+                    USART2_SendString(msg);
+                }
+                else
+                {
+                    // --- 문이 열려있으면 잠금 거부 ---
+                    // 사용자에게 에러 메시지 전송
+                    USART2_SendString("FAIL: Door is OPEN! Close it first.\r\n");
+                }
             }
-            // [해제 명령] CMD:UNLOCK
+            // =========================================================
+            // [수정] 해제 명령 (CMD:UNLOCK) - 굳이 안전장치가 필요하진 않으나 확인 가능
+            // =========================================================
             else if (strcmp((char*)g_bt_rx_buffer, "CMD:UNLOCK") == 0)
             {
-                Servo_Write(1500); // 0도 (열림 위치)
-                current_state = STATE_UNLOCKED;
-                USART2_SendString("OK: UNLOCKED\r\n");
+                // 이미 잠금 해제 상태인지 확인 (선택 사항)
+                if (current_state == STATE_UNLOCKED)
+                {
+                    USART2_SendString("INFO: Already Unlocked.\r\n");
+                }
+                else
+                {
+                    Servo_Write(1500); // 0도 (열림 위치)
+                    current_state = STATE_UNLOCKED;
+                    USART2_SendString("OK: UNLOCKED\r\n");
+                }
             }
             
             // 버퍼 초기화
@@ -545,7 +578,7 @@ int main(void)
         // =========================================================
         if (g_send_temp_flag == 1)
         {
-            uint8_t temp = 0, humi = 0;
+            uint8_t humi = 0;
             char temp_msg[32]; // 전송을 위한 임시 문자열 버퍼 생성
             
             // 1. DHT11 데이터 읽기
