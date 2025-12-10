@@ -24,9 +24,14 @@
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f10x_it.h"
 #include "stm32f10x_exti.h" // [추가] EXTI 관련 함수 사용을 위해
+#include "stm32f10x_usart.h" // [추가] USART 관련 함수 사용을 위해
+#include <string.h>          // [추가] strcmp 함수 사용을 위해
 
 // [추가] main.c의 전역 변수를 인터럽트 핸들러에서 사용하기 위해 extern 선언
 extern volatile uint8_t g_VibrationDetected;
+extern volatile char rx_buffer[];
+extern volatile uint8_t rx_index;
+extern volatile uint8_t AlarmResetFlag;
 
 /** @addtogroup STM32F10x_StdPeriph_Template
   * @{
@@ -160,6 +165,43 @@ void EXTI1_IRQHandler(void)
         
         // 인터럽트 보류 비트 클리어
         EXTI_ClearITPendingBit(EXTI_Line1);
+    }
+}
+
+/**
+  * @brief  This function handles USART2 interrupt request.
+  * @param  None
+  * @retval None
+  */
+void USART2_IRQHandler(void)
+{
+    if(USART_GetITStatus(USART2, USART_IT_RXNE) != RESET) {
+        char received_char = USART_ReceiveData(USART2);
+        
+        if (rx_index < RX_BUFFER_SIZE - 1) {
+            // 개행 문자를 받으면 문자열 처리를 시작
+            if (received_char == '\n' || received_char == '\r') {
+                rx_buffer[rx_index] = '\0'; // 문자열 종료
+                
+                // "RESET" 명령인지 확인
+                if (strcmp((const char*)rx_buffer, "RESET") == 0) {
+                    AlarmResetFlag = 1;
+                }
+                
+                // 버퍼 초기화
+                rx_index = 0;
+                memset((void*)rx_buffer, 0, RX_BUFFER_SIZE);
+            } else {
+                rx_buffer[rx_index++] = received_char;
+            }
+        } else {
+            // 버퍼 오버플로우 방지
+            rx_index = 0;
+            memset((void*)rx_buffer, 0, RX_BUFFER_SIZE);
+        }
+        
+        // RXNE 펜딩 비트 클리어
+        USART_ClearITPendingBit(USART2, USART_IT_RXNE);
     }
 }
 

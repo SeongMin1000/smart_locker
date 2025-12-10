@@ -27,23 +27,16 @@ volatile uint8_t flame_detected = 0;
 
 // 3. 리드 스위치 (문) 상태
 volatile uint8_t g_IsDoorOpen = 0;
-volatile uint32_t g_DoorOpenCount = 0;
 
 // 4. 온습도 센서
 volatile uint32_t g_Temperature = 0;
 volatile uint32_t g_Humidity = 0;
 
 // 5. 진동 센서
-volatile uint32_t g_VibrationCount = 0;
-volatile uint8_t  g_VibrationDetected = 0;
-
-// 6. [NEW] 서보모터 동작 테스트용 변수
-int servo_test_timer = 0;
-uint8_t servo_state = 0; // 0: 닫힘, 1: 열림
+volatile uint8_t  g_VibrationDetected = 0; 
 
 // 7. [NEW] 시스템 상태 정의 (State Machine)
-typedef enum {
-    IDLE = 0,
+typedef enum {    IDLE = 0,
     LOCKED,
     ALARM
 } SystemState_TypeDef;
@@ -67,6 +60,10 @@ void EXTI_Configure(void); // [추가] 외부 인터럽트 설정 함수
 void USART1_Init(void);
 void USART2_Init(void);
 void NVIC_Configure(void);
+
+/* 블루투스 (USART2) 통신용 함수 [추가] */
+void USART2_SendChar(char ch);
+void USART2_SendString(char* str);
 
 /* 서보모터 제어 함수 [추가] */
 void Servo_Write(uint16_t pulse); 
@@ -228,6 +225,20 @@ void USART2_Init(void)
     USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
 }
 
+// [추가] USART2를 통해 한 문자 전송
+void USART2_SendChar(char ch) {
+    while(USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET); // 전송 버퍼가 비워질 때까지 대기
+    USART_SendData(USART2, (uint16_t)ch); // 문자 전송
+    while(USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET);  // 전송 완료될 때까지 대기
+}
+
+// [추가] USART2를 통해 문자열 전송
+void USART2_SendString(char* str) {
+    while(*str) {
+        USART2_SendChar(*str++);
+    }
+}
+
 void NVIC_Configure(void) {
     NVIC_InitTypeDef NVIC_InitStructure;
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
@@ -369,6 +380,15 @@ uint8_t DHT11_Read_Data(uint8_t *temp, uint8_t *humi) {
     return 0;
 }
 
+// 11. [NEW] ALARM 상태 리포팅 타이머
+volatile uint32_t alarm_report_timer = 0;
+
+// 12. [NEW] 블루투스 수신 및 경보 해제용 변수
+#define RX_BUFFER_SIZE 16
+volatile char rx_buffer[RX_BUFFER_SIZE] = {0,};
+volatile uint8_t rx_index = 0;
+volatile uint8_t AlarmResetFlag = 0;
+
 /* ================================================================
  * 메인 함수
  * ================================================================ */
@@ -378,10 +398,9 @@ int main(void)
     RCC_Configure();
     GPIO_Configure();
     EXTI_Configure();
-    USART1_Init();      
-    USART2_Init();      
+    USART1_Init();
+    USART2_Init();
     NVIC_Configure();
-
     // [추가] 서보모터용 PWM 타이머 설정
     TIM_Configure();
 
@@ -390,86 +409,93 @@ int main(void)
     Delay_ms(2000);
     HX711_Tare();
 
-    /* 리드 스위치 상태 관리용 변수 (지역) */
-    uint8_t lastDoorState = 0;
     /* 온습도 센서 타이머용 변수 */
     int dht_timer = 0;
-    /* 진동 센서 이전 상태 저장 변수 */
-    uint8_t lastVibState = 0;
     
-    lastVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
-    lastDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
-
     // 초기 서보 위치 (닫힘: 1500)
     Servo_Write(1500); 
 
     while (1)
     {
-        switch (SystemState) {
-            case IDLE:
-                /* 1. 로드셀 (무게 측정) */
-                raw_data = HX711_Read_Average(10);
-                weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
-
-                /* 2. 불꽃 감지 센서 */
-                if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) {
-                    if (flame_detected == 0) {
-                         flame_detected = 1;
-                         // 화재 발생 시 ALARM 상태로 즉시 전환하는 로직은 향후 추가
+        /* [3-1] 화재 감지 로직 (항상 실행) */
+        if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) {
+            if (flame_detected == 0) {
+                 flame_detected = 1; 
+                 Fire_Flag = 1; // 화재 플래그 설정
+                 alarm_report_timer = 0; // ALARM 상태 진입 시 타이머 초기화
+                 SystemState = ALARM; // 즉시 ALARM 상태로 전환
+                 USART2_SendString("FIRE DETECTED - ALARM\n"); // 블루투스 알림
+            }
+        } else {
+            flame_detected = 0;
+                        // Fire_Flag는 ALARM 상태에서 해제되거나, 특정 조건에서만 해제되도록 관리
                     }
-                } else {
-                    flame_detected = 0;
-                }
-
-                /* 3. 리드 스위치 (문 감지) */
-                g_IsDoorOpen = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
-
-                /* 4. 온습도 센서 */
-                dht_timer++;
-                if (dht_timer >= 200) { // 약 2초마다 측정
-                    dht_timer = 0;
-                    uint8_t t = 0, h = 0;
-                    if (DHT11_Read_Data(&t, &h) == 1) {
-                        g_Temperature = t;
-                        g_Humidity = h;
+            
+                    /* [NEW] 온습도 센서 로직 (항상 실행) */
+                    dht_timer++;
+                    if (dht_timer >= 200) { // 약 2초마다 측정
+                        dht_timer = 0;
+                        uint8_t t = 0, h = 0;
+                        if (DHT11_Read_Data(&t, &h) == 1) {
+                            g_Temperature = t;
+                            g_Humidity = h;
+                        }
                     }
-                }
-
-                /* 5. 자동 잠금 로직 */
-                if (g_IsDoorOpen == 0) { // 문이 닫혔으면 (신호 0)
-                    door_close_timer++;
-                } else { // 문이 열렸으면
-                    door_close_timer = 0;
-                }
-
-                // 3초 (300 * 10ms) 이상 문이 닫혀 있으면 잠금 상태로 전환
-                if (door_close_timer > 300) {
-                    Servo_Write(1500); // 서보모터 잠금 (닫힘 위치)
-                    Base_Weight = weight; // 현재 무게를 기준 무게로 저장
-                    g_VibrationDetected = 0; // 진동 플래그 초기화
-                    lock_cooldown_timer = 0; // 쿨다운 타이머 초기화
-                    SystemState = LOCKED; // 상태를 LOCKED로 변경
-                    door_close_timer = 0; // 타이머 초기화
-                }
-                break; // End of IDLE case
+            
+                    switch (SystemState) {
+                        case IDLE:
+                            /* 1. 로드셀 (무게 측정) - 잠금 직전에만 필요하므로 IDLE에서 계속 측정 */
+                            raw_data = HX711_Read_Average(10);
+                            weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
+                            
+                            /* 2. 자동 잠금 로직 */
+                            if (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3) == 0) { // 문이 닫혔으면 (신호 0)
+                                door_close_timer++;
+                            } else { // 문이 열렸으면
+                                door_close_timer = 0;
+                            }
+            
+                            // 3초 (300 * 10ms) 이상 문이 닫혀 있으면 잠금 상태로 전환
+                            if (door_close_timer > 300) {
+                                Servo_Write(1500); // 서보모터 잠금 (닫힘 위치)
+                                Base_Weight = weight; // 현재 무게를 기준 무게로 저장
+                                g_VibrationDetected = 0; // 진동 플래그 초기화
+                                lock_cooldown_timer = 0; // 쿨다운 타이머 초기화
+                                SystemState = LOCKED; // 상태를 LOCKED로 변경
+                                door_close_timer = 0; // 타이머 초기화
+                                USART2_SendString("LOCKER LOCKED\n"); // 블루투스 알림
+                            }
+                            break; // End of IDLE case
 
             case LOCKED:
                 // 1. 쿨다운 타이머
                 if (lock_cooldown_timer < 300) {
                     lock_cooldown_timer++;
                 } else {
-                    // 2. 진동 감지
-                    if (g_VibrationDetected == 1) {
+                    // 2. 강제 개방 감지 (리드 스위치)
+                    // LOCKED 상태에서 문이 열리면 ALARM
+                    if (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3) == 1) { // 문 열림
+                        alarm_report_timer = 0; // ALARM 상태 진입 시 타이머 초기화
                         SystemState = ALARM;
+                        USART2_SendString("FORCED OPENING DETECTED - ALARM\n"); // 블루투스 알림
+                    }
+
+                    // 3. 진동 감지
+                    if (g_VibrationDetected == 1) {
+                        alarm_report_timer = 0; // ALARM 상태 진입 시 타이머 초기화
+                        SystemState = ALARM;
+                        USART2_SendString("VIBRATION DETECTED - ALARM\n"); // 블루투스 알림
                     }
                     
-                    // 3. 물품 탈취 감지 (무게)
+                    // 4. 물품 탈취 감지 (무게)
                     raw_data = HX711_Read_Average(10);
                     weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
 
                     // 기준 무게 대비 임계값 이상 감소 시 ALARM
                     if ((Base_Weight - weight) > WEIGHT_THRESHOLD) {
+                        alarm_report_timer = 0; // ALARM 상태 진입 시 타이머 초기화
                         SystemState = ALARM;
+                        USART2_SendString("WEIGHT CHANGE - ALARM\n"); // 블루투스 알림
                     }
                 }
 
@@ -479,7 +505,37 @@ int main(void)
                 break;
 
             case ALARM:
-                // ALARM 상태 로직 (향후 구현 예정)
+                // 경보 해제 로직
+                if (AlarmResetFlag == 1) {
+                    SystemState = IDLE; // IDLE 상태로 전환
+                    AlarmResetFlag = 0; // 플래그 초기화
+                    Fire_Flag = 0;      // 화재 플래그 초기화
+                    g_VibrationDetected = 0; // 진동 플래그 초기화
+                    alarm_report_timer = 0;  // 경보 리포팅 타이머 초기화
+
+                    Servo_Write(1500); // 다시 문 잠금
+                    USART2_SendString("ALARM CLEARED\n"); // 블루투스 알림
+                    break; // ALARM 상태 즉시 탈출
+                }
+
+                // 주기적으로 경보 메시지 전송 (예: 1초마다)
+                alarm_report_timer++;
+                if (alarm_report_timer > 100) { // 1초 (100 * 10ms)
+                    alarm_report_timer = 0;
+                    if (Fire_Flag == 1) {
+                        USART2_SendString("FIRE ALARM - DOOR OPENED\n");
+                    } else {
+                        USART2_SendString("ALARM ACTIVE\n");
+                    }
+                }
+
+                // 화재 경보인 경우 자동 잠금 해제
+                if (Fire_Flag == 1) {
+                    Servo_Write(2400); // 문 개방
+                }
+                
+                // 다른 경보 (진동, 무게 등)에 대한 처리 (향후 추가)
+                
                 break;
         }
         /* 루프 딜레이 */
