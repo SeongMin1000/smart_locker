@@ -15,18 +15,15 @@
 ... (이전 내용 생략) ...
 
 ### [2-2] 진동 감지 알고리즘 구현 완료
+... (이전 내용 생략) ...
 
-`gemini.md`의 `[2-2]` 단계에 따라, 인터럽트 기반의 진동 감지 및 쿨다운 로직을 구현했습니다.
+### [2-3] 무게 감지 로직 구현 완료
+
+`gemini.md`의 `[2-3]` 단계에 따라, `LOCKED` 상태에서 물품 탈취를 감지하는 무게 감지 로직을 구현했습니다.
 
 *   **`user/main.c` 수정:**
-    *   `lock_cooldown_timer` 전역 변수를 추가하여 `LOCKED` 상태 진입 후 3초의 쿨다운을 구현했습니다.
-    *   `EXTI_Configure()` 함수를 추가하여 진동 센서(PC1)가 외부 인터럽트(EXTI1)를 사용하도록 설정했습니다.
-    *   `LOCKED` 상태에서 쿨다운이 끝난 후 `g_VibrationDetected` 플래그가 1이면 `ALARM` 상태로 전환되도록 로직을 추가했습니다.
-    *   `IDLE` 상태에서 `LOCKED` 상태로 전환될 때, `g_VibrationDetected`와 `lock_cooldown_timer`를 초기화하도록 수정했습니다.
+    *   `WEIGHT_THRESHOLD` 상수를 `100.0f`로 정의하여, 100g 이상의 무게 감소를 감지할 임계값으로 설정했습니다.
+    *   `LOCKED` 상태 내에서 `HX711_Read_Average`를 통해 현재 무게를 측정하고, `Base_Weight`와 비교하는 로직을 추가했습니다.
+    *   `(Base_Weight - weight) > WEIGHT_THRESHOLD` 조건이 만족되면 `SystemState`를 즉시 `ALARM`으로 전환하도록 구현했습니다.
 
-*   **`user/stm32f10x_it.c` 및 `user/inc/stm32f10x_it.h` 수정:**
-    *   `stm32f10x_it.c`에 `EXTI1_IRQHandler`를 구현하여, 진동 감지 시 `g_VibrationDetected` 플래그를 1로 설정하도록 했습니다.
-    *   `stm32f10x_it.c` 내에 `g_VibrationDetected` 변수를 `extern`으로 선언하여 `main.c`의 변수에 접근할 수 있도록 했습니다.
-    *   `stm32f10x_it.h`의 불필요한 `extern` 선언을 정리했습니다.
-
-이로써 시스템은 잠금 상태에서 오작동을 방지하는 쿨다운 기능을 갖추게 되었고, 외부 충격 시 안정적으로 경보 상태로 전환할 수 있게 되었습니다.
+이로써 사물함이 잠긴 상태에서 물품 도난 시도를 무게 변화로 감지하여 경보를 발생시키는 기능이 추가되었습니다.

@@ -10,9 +10,11 @@
 /* ================================================================
  * [사용자 설정] HX711 핀 & 보정 계수
  * ================================================================ */
-float Calibration_Factor = 400.0f; 
+float Calibration_Factor = 400.0f;
 long Zero_Offset = 0;
 
+// [NEW] 무게 감지 임계값 (예: 100g)
+const float WEIGHT_THRESHOLD = 100.0f;
 /* ================================================================
  * 전역 변수
  * ================================================================ */
@@ -452,21 +454,27 @@ int main(void)
                 break; // End of IDLE case
 
             case LOCKED:
-                // 3초 (300 * 10ms) 쿨다운
+                // 1. 쿨다운 타이머
                 if (lock_cooldown_timer < 300) {
                     lock_cooldown_timer++;
                 } else {
-                    // 쿨다운 이후, 진동이 감지되면 ALARM 상태로 전환
+                    // 2. 진동 감지
                     if (g_VibrationDetected == 1) {
                         SystemState = ALARM;
-                        // ALARM 상태 진입 시 필요한 초기화는 ALARM 로직에서 수행
+                    }
+                    
+                    // 3. 물품 탈취 감지 (무게)
+                    raw_data = HX711_Read_Average(10);
+                    weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
+
+                    // 기준 무게 대비 임계값 이상 감소 시 ALARM
+                    if ((Base_Weight - weight) > WEIGHT_THRESHOLD) {
+                        SystemState = ALARM;
                     }
                 }
 
                 // 강제 개방 감지 (향후 구현 예정)
                 
-                // 물품 탈취 감지 (향후 구현 예정)
-
                 // 화재 감시 (향후 구현 예정)
                 break;
 
