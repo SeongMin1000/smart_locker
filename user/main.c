@@ -32,13 +32,24 @@ volatile uint32_t g_Temperature = 0;
 volatile uint32_t g_Humidity = 0;
 
 // 5. 진동 센서
-volatile uint32_t g_VibrationCount = 0;   
-volatile uint8_t  g_VibrationDetected = 0; 
+volatile uint32_t g_VibrationCount = 0;
+volatile uint8_t  g_VibrationDetected = 0;
 
 // 6. [NEW] 서보모터 동작 테스트용 변수
 int servo_test_timer = 0;
 uint8_t servo_state = 0; // 0: 닫힘, 1: 열림
 
+// 7. [NEW] 시스템 상태 정의 (State Machine)
+typedef enum {
+    IDLE = 0,
+    LOCKED,
+    ALARM
+} SystemState_TypeDef;
+
+volatile SystemState_TypeDef SystemState = IDLE; // 초기 상태는 IDLE
+
+// 8. [NEW] 화재 경보 플래그
+volatile uint8_t Fire_Flag = 0;
 /* function prototype */
 void RCC_Configure(void);
 void GPIO_Configure(void);
@@ -360,71 +371,81 @@ int main(void)
 
     while (1)
     {
-        /* 1. 로드셀 (무게 측정) */
-        raw_data = HX711_Read_Average(10);
-        weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
-        
-        /* 2. 불꽃 감지 센서 */
-        if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) {
-            if (flame_detected == 0) {
-                 flame_detected = 1; 
-                 // 화재 시 문 열기 (예시)
-                 // Servo_Write(2400); 
-            }
-        } else {
-            flame_detected = 0;
+        switch (SystemState) {
+            case IDLE:
+                /* 1. 로드셀 (무게 측정) */
+                raw_data = HX711_Read_Average(10);
+                weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
+                
+                /* 2. 불꽃 감지 센서 */
+                if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) {
+                    if (flame_detected == 0) {
+                        flame_detected = 1; 
+                        // 화재 시 문 열기 (예시)
+                        // Servo_Write(2400); 
+                    }
+                } else {
+                    flame_detected = 0;
+                }
+
+                /* 3. 리드 스위치 (문 감지) */
+                uint8_t currentDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
+                g_IsDoorOpen = currentDoorState;
+
+                if (lastDoorState == 0 && currentDoorState == 1) {
+                    g_DoorOpenCount++; 
+                    Delay_ms(50);      
+                } else if (lastDoorState == 1 && currentDoorState == 0) {
+                    Delay_ms(50);      
+                }
+                lastDoorState = currentDoorState;
+
+                /* 4. 온습도 센서 */
+                dht_timer++; 
+                if (dht_timer >= 200) {
+                    dht_timer = 0; 
+                    uint8_t t = 0, h = 0;
+                    if (DHT11_Read_Data(&t, &h) == 1) {
+                        g_Temperature = t;
+                        g_Humidity = h;
+                    }
+                }
+
+                /* 5. 진동 센서 */
+                uint8_t currentVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
+                g_VibrationDetected = currentVibState;
+
+                if (lastVibState == 0 && currentVibState == 1) {
+                    g_VibrationCount++; 
+                    Delay_ms(50); 
+                }
+                lastVibState = currentVibState;
+
+                /* =======================================================
+                * [NEW] 서보모터 동작 테스트 코드
+                * 2초(200 loop * 10ms)마다 열렸다 닫혔다 반복
+                * ======================================================= */
+                servo_test_timer++;
+                if (servo_test_timer > 200) { // 약 2초마다 실행
+                    servo_test_timer = 0;
+                    if (servo_state == 0) {
+                        Servo_Write(2400); // 열림 (각도 조절 필요: 500~2500)
+                        servo_state = 1;
+                    } else {
+                        Servo_Write(1500); // 닫힘
+                        servo_state = 0;
+                    }
+                }
+                break; // End of IDLE case
+
+            case LOCKED:
+                // LOCKED 상태 로직 (향후 구현 예정)
+                break;
+
+            case ALARM:
+                // ALARM 상태 로직 (향후 구현 예정)
+                break;
         }
-
-        /* 3. 리드 스위치 (문 감지) */
-        uint8_t currentDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
-        g_IsDoorOpen = currentDoorState;
-
-        if (lastDoorState == 0 && currentDoorState == 1) {
-            g_DoorOpenCount++; 
-            Delay_ms(50);      
-        } else if (lastDoorState == 1 && currentDoorState == 0) {
-            Delay_ms(50);      
-        }
-        lastDoorState = currentDoorState;
-
-        /* 4. 온습도 센서 */
-        dht_timer++; 
-        if (dht_timer >= 200) {
-            dht_timer = 0; 
-            uint8_t t = 0, h = 0;
-            if (DHT11_Read_Data(&t, &h) == 1) {
-                g_Temperature = t;
-                g_Humidity = h;
-            }
-        }
-
-        /* 5. 진동 센서 */
-        uint8_t currentVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
-        g_VibrationDetected = currentVibState;
-
-        if (lastVibState == 0 && currentVibState == 1) {
-            g_VibrationCount++; 
-            Delay_ms(50); 
-        }
-        lastVibState = currentVibState;
-
-
-        /* =======================================================
-         * [NEW] 서보모터 동작 테스트 코드
-         * 2초(200 loop * 10ms)마다 열렸다 닫혔다 반복
-         * ======================================================= */
-        servo_test_timer++;
-        if (servo_test_timer > 200) { // 약 2초마다 실행
-            servo_test_timer = 0;
-            if (servo_state == 0) {
-                Servo_Write(2400); // 열림 (각도 조절 필요: 500~2500)
-                servo_state = 1;
-            } else {
-                Servo_Write(1500); // 닫힘
-                servo_state = 0;
-            }
-        }
-
         /* 루프 딜레이 */
         Delay_ms(10);
     }
