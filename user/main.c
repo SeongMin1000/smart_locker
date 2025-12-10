@@ -50,10 +50,18 @@ volatile SystemState_TypeDef SystemState = IDLE; // 초기 상태는 IDLE
 
 // 8. [NEW] 화재 경보 플래그
 volatile uint8_t Fire_Flag = 0;
+
+// 9. [NEW] 자동 잠금 로직용 변수
+volatile float Base_Weight = 0.0f;
+volatile uint32_t door_close_timer = 0;
+
+// 10. [NEW] 잠금 후 진동 감지 쿨다운 타이머
+volatile uint32_t lock_cooldown_timer = 0;
 /* function prototype */
 void RCC_Configure(void);
 void GPIO_Configure(void);
 void TIM_Configure(void); // [추가] PWM 타이머 설정 함수
+void EXTI_Configure(void); // [추가] 외부 인터럽트 설정 함수
 void USART1_Init(void);
 void USART2_Init(void);
 void NVIC_Configure(void);
@@ -155,6 +163,9 @@ void GPIO_Configure(void)
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING; 
     GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+    // [추가] 진동 센서(PC1) 핀을 EXTI 라인 1에 연결
+    GPIO_EXTILineConfig(GPIO_PortSourceGPIOC, GPIO_PinSource1);
 }
 
 /* [추가] TIM3 설정 함수 (PWM for Servo) */
@@ -232,6 +243,26 @@ void NVIC_Configure(void) {
     NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1; 
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0; 
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+}
+
+/* [추가] 외부 인터럽트(진동센서) 설정 함수 */
+void EXTI_Configure(void) {
+    EXTI_InitTypeDef EXTI_InitStructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+    // EXTI 라인 1 (진동 센서) 설정
+    EXTI_InitStructure.EXTI_Line = EXTI_Line1;
+    EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+    EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Rising; // 진동 발생 시 Rising Edge
+    EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+    EXTI_Init(&EXTI_InitStructure);
+
+    // EXTI 라인 1에 대한 NVIC 설정
+    NVIC_InitStructure.NVIC_IRQChannel = EXTI1_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2; // 우선순위 설정
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&NVIC_InitStructure);
 }
@@ -344,6 +375,7 @@ int main(void)
     SystemInit();
     RCC_Configure();
     GPIO_Configure();
+    EXTI_Configure();
     USART1_Init();      
     USART2_Init();      
     NVIC_Configure();
@@ -376,34 +408,24 @@ int main(void)
                 /* 1. 로드셀 (무게 측정) */
                 raw_data = HX711_Read_Average(10);
                 weight = (float)(raw_data - Zero_Offset) / Calibration_Factor;
-                
+
                 /* 2. 불꽃 감지 센서 */
                 if (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3) == Bit_RESET) {
                     if (flame_detected == 0) {
-                        flame_detected = 1; 
-                        // 화재 시 문 열기 (예시)
-                        // Servo_Write(2400); 
+                         flame_detected = 1;
+                         // 화재 발생 시 ALARM 상태로 즉시 전환하는 로직은 향후 추가
                     }
                 } else {
                     flame_detected = 0;
                 }
 
                 /* 3. 리드 스위치 (문 감지) */
-                uint8_t currentDoorState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
-                g_IsDoorOpen = currentDoorState;
-
-                if (lastDoorState == 0 && currentDoorState == 1) {
-                    g_DoorOpenCount++; 
-                    Delay_ms(50);      
-                } else if (lastDoorState == 1 && currentDoorState == 0) {
-                    Delay_ms(50);      
-                }
-                lastDoorState = currentDoorState;
+                g_IsDoorOpen = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_3);
 
                 /* 4. 온습도 센서 */
-                dht_timer++; 
-                if (dht_timer >= 200) {
-                    dht_timer = 0; 
+                dht_timer++;
+                if (dht_timer >= 200) { // 약 2초마다 측정
+                    dht_timer = 0;
                     uint8_t t = 0, h = 0;
                     if (DHT11_Read_Data(&t, &h) == 1) {
                         g_Temperature = t;
@@ -411,35 +433,41 @@ int main(void)
                     }
                 }
 
-                /* 5. 진동 센서 */
-                uint8_t currentVibState = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_1);
-                g_VibrationDetected = currentVibState;
-
-                if (lastVibState == 0 && currentVibState == 1) {
-                    g_VibrationCount++; 
-                    Delay_ms(50); 
+                /* 5. 자동 잠금 로직 */
+                if (g_IsDoorOpen == 0) { // 문이 닫혔으면 (신호 0)
+                    door_close_timer++;
+                } else { // 문이 열렸으면
+                    door_close_timer = 0;
                 }
-                lastVibState = currentVibState;
 
-                /* =======================================================
-                * [NEW] 서보모터 동작 테스트 코드
-                * 2초(200 loop * 10ms)마다 열렸다 닫혔다 반복
-                * ======================================================= */
-                servo_test_timer++;
-                if (servo_test_timer > 200) { // 약 2초마다 실행
-                    servo_test_timer = 0;
-                    if (servo_state == 0) {
-                        Servo_Write(2400); // 열림 (각도 조절 필요: 500~2500)
-                        servo_state = 1;
-                    } else {
-                        Servo_Write(1500); // 닫힘
-                        servo_state = 0;
-                    }
+                // 3초 (300 * 10ms) 이상 문이 닫혀 있으면 잠금 상태로 전환
+                if (door_close_timer > 300) {
+                    Servo_Write(1500); // 서보모터 잠금 (닫힘 위치)
+                    Base_Weight = weight; // 현재 무게를 기준 무게로 저장
+                    g_VibrationDetected = 0; // 진동 플래그 초기화
+                    lock_cooldown_timer = 0; // 쿨다운 타이머 초기화
+                    SystemState = LOCKED; // 상태를 LOCKED로 변경
+                    door_close_timer = 0; // 타이머 초기화
                 }
                 break; // End of IDLE case
 
             case LOCKED:
-                // LOCKED 상태 로직 (향후 구현 예정)
+                // 3초 (300 * 10ms) 쿨다운
+                if (lock_cooldown_timer < 300) {
+                    lock_cooldown_timer++;
+                } else {
+                    // 쿨다운 이후, 진동이 감지되면 ALARM 상태로 전환
+                    if (g_VibrationDetected == 1) {
+                        SystemState = ALARM;
+                        // ALARM 상태 진입 시 필요한 초기화는 ALARM 로직에서 수행
+                    }
+                }
+
+                // 강제 개방 감지 (향후 구현 예정)
+                
+                // 물품 탈취 감지 (향후 구현 예정)
+
+                // 화재 감시 (향후 구현 예정)
                 break;
 
             case ALARM:

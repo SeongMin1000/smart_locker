@@ -23,6 +23,10 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f10x_it.h"
+#include "stm32f10x_exti.h" // [추가] EXTI 관련 함수 사용을 위해
+
+// [추가] main.c의 전역 변수를 인터럽트 핸들러에서 사용하기 위해 extern 선언
+extern volatile uint8_t g_VibrationDetected;
 
 /** @addtogroup STM32F10x_StdPeriph_Template
   * @{
@@ -142,6 +146,22 @@ void SysTick_Handler(void)
 /*  available peripheral interrupt handler's name please refer to the startup */
 /*  file (startup_stm32f10x_xx.s).                                            */
 /******************************************************************************/
+
+/**
+  * @brief  This function handles EXTI Line 1 interrupt request.
+  * @param  None
+  * @retval None
+  */
+void EXTI1_IRQHandler(void)
+{
+    if (EXTI_GetITStatus(EXTI_Line1) != RESET) {
+        // 진동 감지 시 플래그 설정
+        g_VibrationDetected = 1;
+        
+        // 인터럽트 보류 비트 클리어
+        EXTI_ClearITPendingBit(EXTI_Line1);
+    }
+}
 
 /**
   * @brief  This function handles PPP interrupt request.
