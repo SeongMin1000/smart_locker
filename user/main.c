@@ -3,7 +3,10 @@
 #include "stm32f10x_gpio.h"
 #include "stm32f10x_usart.h"
 #include "stm32f10x_rcc.h"
-#include "stm32f10x_tim.h" // [추가] 타이머 헤더
+#include "stm32f10x_tim.h"
+
+#include <string.h>
+#include <stdio.h>
 
 #include "misc.h"
 
@@ -12,6 +15,14 @@
  * ================================================================ */
 float Calibration_Factor = 400.0f; 
 long Zero_Offset = 0;
+
+/* ================================================================
+ * [추가] UART2(블루투스) 관련 변수
+ * ================================================================ */
+#define MAX_RX_BUF 100
+volatile char g_bt_rx_buffer[MAX_RX_BUF]; // 수신 버퍼
+volatile uint8_t g_bt_rx_index = 0;       // 버퍼 인덱스
+volatile uint8_t g_bt_data_ready = 0;     // 수신 완료 플래그 (1이면 데이터 있음)
 
 /* ================================================================
  * 전역 변수
@@ -64,6 +75,11 @@ void DHT11_GPIO_Input(void);
 uint8_t DHT11_Read_Data(uint8_t *temp, uint8_t *humi);
 void DHT11_Delay_us(uint32_t us);
 
+/* 블루투스 함수*/
+void USART2_SendString(char* str);
+void USART2_IRQHandler(void);
+void Process_Bluetooth_Command(void);
+
 
 // 주변장치 클럭 부여
 void RCC_Configure(void)
@@ -113,6 +129,8 @@ void GPIO_Configure(void)
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING; 
     GPIO_Init(GPIOD, &GPIO_InitStructure);
+
+    GPIO_PinRemapConfig(GPIO_Remap_USART2, ENABLE); // <--- 이 부분!
 
    /* HX711 pin setting */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6;
@@ -325,6 +343,91 @@ uint8_t DHT11_Read_Data(uint8_t *temp, uint8_t *humi) {
     return 0;
 }
 
+/* 문자열 송신 함수 */
+void USART2_SendString(char* str)
+{
+    while (*str) // null 문자('\0') 만날 때까지 반복
+    {
+        // 데이터 레지스터가 비었는지 확인 (TXE 플래그)
+        while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
+        
+        // 한 글자 전송
+        USART_SendData(USART2, *str++);
+    }
+}
+
+void USART2_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART2, USART_IT_RXNE) != RESET)
+    {
+        // 1. 블루투스로부터 문자 1개 수신
+        char ch = USART_ReceiveData(USART2);
+
+        // ==========================================================
+        // [추가된 부분] PC 터미널로 즉시 전송 (에코/디버깅용)
+        // ==========================================================
+        // USART1의 송신 버퍼가 빌 때까지 기다렸다가 전송
+        while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET); 
+        USART_SendData(USART1, ch); 
+        // ==========================================================
+
+        // 2. 기존 도어락 명령어 처리 로직 (버퍼에 저장)
+        if (ch == '\n' || ch == '\r') 
+        {
+            if (g_bt_rx_index > 0) 
+            {
+                g_bt_rx_buffer[g_bt_rx_index] = '\0'; // 문자열 끝 표시
+                g_bt_data_ready = 1;                  // 메인 루프에 알림
+                g_bt_rx_index = 0;                    // 인덱스 초기화
+            }
+        }
+        else
+        {
+            if (g_bt_rx_index < MAX_RX_BUF - 1)
+            {
+                g_bt_rx_buffer[g_bt_rx_index++] = ch;
+            }
+        }
+        
+        // 플래그 클리어 (보통 읽기만 해도 클리어되지만 안전하게)
+        USART_ClearITPendingBit(USART2, USART_IT_RXNE);
+    }
+}
+
+void Process_Bluetooth_Command(void)
+{
+    if (g_bt_data_ready) // 수신된 명령어가 있다면
+    {
+        g_bt_data_ready = 0; // 플래그 초기화
+
+        // 1. 잠금 해제 명령 (CMD: UNLOCK)
+        if (strcmp((char*)g_bt_rx_buffer, "CMD: UNLOCK") == 0)
+        {
+            Servo_Write(2400); // 서보모터 열림 각도 (값은 캘리브레이션 필요)
+            servo_state = 1;   // 상태 변수 업데이트
+            USART2_SendString("OK: Door Unlocked\r\n"); // 폰으로 응답 전송
+        }
+        // 2. 잠금 명령 (CMD: LOCK)
+        else if (strcmp((char*)g_bt_rx_buffer, "CMD: LOCK") == 0)
+        {
+            Servo_Write(1500); // 서보모터 닫힘 각도 (값은 캘리브레이션 필요)
+            servo_state = 0;   // 상태 변수 업데이트
+            USART2_SendString("OK: Door Locked\r\n"); // 폰으로 응답 전송
+        }
+        // 3. 알 수 없는 명령어
+        else 
+        {
+            // 디버깅용: 받은 이상한 명령어를 다시 보내봄
+            char msg[80];
+            sprintf(msg, "ERROR: Unknown Command [%s]\r\n", g_bt_rx_buffer);
+            USART2_SendString(msg);
+        }
+        
+        // 버퍼 초기화 (잔여 데이터 방지)
+        memset((void*)g_bt_rx_buffer, 0, MAX_RX_BUF);
+    }
+}
+
 /* ================================================================
  * 메인 함수
  * ================================================================ */
@@ -424,6 +527,9 @@ int main(void)
                 servo_state = 0;
             }
         }
+
+        // [추가] 블루투스 명령어 처리
+        Process_Bluetooth_Command();
 
         /* 루프 딜레이 */
         Delay_ms(10);
