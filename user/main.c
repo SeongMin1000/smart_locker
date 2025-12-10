@@ -18,6 +18,10 @@ volatile char g_bt_rx_buffer[MAX_RX_BUF]; // 수신 버퍼
 volatile uint8_t g_bt_rx_index = 0;       // 버퍼 인덱스
 volatile uint8_t g_bt_data_ready = 0;     // 수신 완료 플래그 (1이면 데이터 있음)
 
+// [추가] 5초 타이머 및 DMA 전송용 변수
+volatile uint8_t g_timer_sec_count = 0; // 초 카운트
+volatile uint8_t g_send_temp_flag = 1;  // 5초 전송 플래그
+
 /* ================================================================
  * 전역 변수
  * ================================================================ */
@@ -90,6 +94,9 @@ void RCC_Configure(void)
 
    /* [추가] 서보모터 PWM용 TIM3 클럭 (APB1) */
    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+
+   /* [추가] TIM4(시간 측정용) */
+   RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
 }
 
 void GPIO_Configure(void)
@@ -226,6 +233,13 @@ void NVIC_Configure(void) {
     NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1; 
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0; 
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    // [추가] TIM4 인터럽트 설정
+    NVIC_InitStructure.NVIC_IRQChannel = TIM4_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2; // 우선순위 낮게 설정
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&NVIC_InitStructure);
 }
@@ -416,6 +430,40 @@ void Process_Bluetooth_Command(void)
     }
 }
 
+/* [추가] 5초 카운팅을 위한 TIM4 설정 (1초마다 인터럽트) */
+void TIM4_Configure(void)
+{
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+    
+    // 72MHz / 7200 = 10kHz (0.1ms)
+    // Period = 10000 -> 10000 * 0.1ms = 1000ms = 1초
+    TIM_TimeBaseStructure.TIM_Prescaler = 7200 - 1;
+    TIM_TimeBaseStructure.TIM_Period = 10000 - 1;
+    TIM_TimeBaseStructure.TIM_ClockDivision = 0;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    
+    TIM_TimeBaseInit(TIM4, &TIM_TimeBaseStructure);
+    TIM_ITConfig(TIM4, TIM_IT_Update, ENABLE); // 업데이트 인터럽트 허용
+    TIM_Cmd(TIM4, ENABLE);
+}
+
+/* [추가] TIM4 인터럽트 핸들러 */
+void TIM4_IRQHandler(void)
+{
+    if (TIM_GetITStatus(TIM4, TIM_IT_Update) != RESET)
+    {
+        g_timer_sec_count++;
+        
+        if (g_timer_sec_count >= 5) // 5초가 되면
+        {
+            g_timer_sec_count = 0;
+            g_send_temp_flag = 1; // 메인 루프에 알림
+        }
+        
+        TIM_ClearITPendingBit(TIM4, TIM_IT_Update);
+    }
+}
+
 /* 딜레이 함수 */
 void Delay_us(uint32_t us) { us *= 12; while(us--); }
 void Delay_ms(uint32_t ms) { while(ms--) Delay_us(1000); }
@@ -429,7 +477,9 @@ int main(void)
     RCC_Configure();
     GPIO_Configure();
     USART1_Init();      
-    USART2_Init();      
+    USART2_Init();
+    TIM4_Configure(); // 5초 타이머 시작
+
     NVIC_Configure();
     TIM_Configure();
 
@@ -488,6 +538,32 @@ int main(void)
             
             // 버퍼 초기화
             memset((void*)g_bt_rx_buffer, 0, MAX_RX_BUF);
+        }
+
+        // =========================================================
+        // [추가] 5초마다 온습도 전송
+        // =========================================================
+        if (g_send_temp_flag == 1)
+        {
+            uint8_t temp = 0, humi = 0;
+            char temp_msg[32]; // 전송을 위한 임시 문자열 버퍼 생성
+            
+            // 1. DHT11 데이터 읽기
+            if (DHT11_Read_Data(&temp, &humi)) 
+            {
+                // 2. 보낼 문자열 포맷팅
+                sprintf(temp_msg, "T=%d\n", temp);
+                
+                // 3. 기존 문자열 송신 함수 사용 (Blocking 방식)
+                USART2_SendString(temp_msg);
+            }
+            else
+            {
+                // (선택사항) 센서 읽기 실패 시 에러 메시지 전송
+                // USART2_SendString("Err: DHT11 Fail\r\n");
+            }
+            
+            g_send_temp_flag = 0; // 플래그 초기화
         }
 
         // ---------------------------------------------------------
