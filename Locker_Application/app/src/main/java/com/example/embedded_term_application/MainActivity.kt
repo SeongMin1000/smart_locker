@@ -55,6 +55,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnRefreshLog: Button
     private lateinit var btnShareLog: Button
     private lateinit var btnZero: Button
+    private lateinit var cbShowRx: CheckBox // [추가] Raw Data 체크박스
 
     // 센서 UI
     private lateinit var tvValTemp: TextView
@@ -231,6 +232,9 @@ class MainActivity : AppCompatActivity() {
         btnSettings = findViewById(R.id.btnSettings)
         btnZero = findViewById(R.id.btnZero)
         ivStatusIcon = findViewById(R.id.ivStatusIcon)
+
+        // [추가] 체크박스 연결
+        cbShowRx = findViewById(R.id.cbShowRx)
 
         val cardTemp = findViewById<View>(R.id.cardTemp)
         cardTemp.findViewById<TextView>(R.id.tvSensorLabel).text = "Temperature"
@@ -547,7 +551,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // =========================================================================
+    // 데이터 파싱 및 알림 로직 (설정된 임계값 사용)
+    // =========================================================================
     private fun parseAndDisplay(data: String) {
+        // [수정] 체크박스가 켜져있으면 Raw Data 로그 출력
+        if (cbShowRx.isChecked) {
+            addLog("[RX] $data")
+        }
+
         if (data.isEmpty()) return
 
         try {
