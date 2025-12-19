@@ -14,6 +14,8 @@
  * UART2(블루투스) 관련 변수
  * ================================================================ */
 #define MAX_RX_BUF 64
+#define ABS(x) ((x) < 0 ? -(x) : (x))
+
 volatile char g_bt_rx_buffer[MAX_RX_BUF]; // 수신 버퍼
 volatile uint8_t g_bt_rx_index = 0;       // 버퍼 인덱스
 volatile uint8_t g_bt_data_ready = 0;     // 수신 완료 플래그 (1이면 데이터 있음)
@@ -42,7 +44,7 @@ SafeState current_state = STATE_UNLOCKED;
 long reference_weight = 0; // 잠금 시점의 무게 (물건 있음)
 long current_weight = 0;   // 실시간 무게
 const long EMPTY_WEIGHT = 826000; // 아무것도 없을 때의 기본값 (보정 필요)
-const long THRESHOLD = 10000;      // 오차 범위 (센서 노이즈 감안)
+const long THRESHOLD = 150000;      // 오차 범위 (센서 노이즈 감안)
 
 uint8_t servo_state = 0; // 0: 닫힘, 1: 열림
 
@@ -574,27 +576,35 @@ int main(void)
         }
 
         // =========================================================
-        // [추가] 5초마다 온습도 전송
+        // [수정] 5초마다 온도, 무게, 불꽃감지 센서 값을 통합 전송
         // =========================================================
         if (g_send_temp_flag == 1)
         {
             uint8_t humi = 0;
-            char temp_msg[32]; // 전송을 위한 임시 문자열 버퍼 생성
+            uint8_t flame_status = 0;
+            char combined_msg[64]; // 데이터가 길어졌으므로 버퍼 크기를 64로 확장
             
-            // 1. DHT11 데이터 읽기
-            if (DHT11_Read_Data(&temp, &humi)) 
-            {
-                // 2. 보낼 문자열 포맷팅
-                sprintf(temp_msg, "T=%d\n", temp);
-                
-                // 3. 기존 문자열 송신 함수 사용 (Blocking 방식)
-                USART2_SendString(temp_msg);
-            }
-            else
-            {
-                // (선택사항) 센서 읽기 실패 시 에러 메시지 전송
-                // USART2_SendString("Err: DHT11 Fail\r\n");
-            }
+            // 1. 센서 데이터 업데이트
+            // 온습도 읽기
+            DHT11_Read_Data(&temp, &humi); 
+            
+            // 실시간 무게(압력) 읽기
+            current_weight = HX711_Read(); 
+            
+            // 불꽃 감지 센서 읽기 (GPIOD Pin 3)
+            // IPU 설정이므로: 불꽃 감지 시 0(Low), 평상시 1(High)
+            flame_status = GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_3);
+
+            // 2. 문자열 포맷팅
+            // T: 온도, W: 무게(long), F: 불꽃상태(0:감지, 1:정상)
+            // 앱에서 파싱하기 쉽도록 콤마(,)와 식별자(T, W, F)를 사용합니다.
+            sprintf(combined_msg, "T=%d, W=%ld, F=%d\n", temp, ABS(reference_weight - current_weight), flame_status);
+            
+            // 3. 블루투스(USART2)로 전송
+            USART2_SendString(combined_msg);
+            
+            // (선택 사항) PC 디버깅 확인용 USART1 전송
+            // USART1_SendString(combined_msg); 
             
             g_send_temp_flag = 0; // 플래그 초기화
         }
@@ -605,12 +615,12 @@ int main(void)
         if (current_state == STATE_LOCKED)
         {
             current_weight = HX711_Read(); // 실시간 무게 측정
-
             // 도난 판단 조건:
             // (기준 무게보다 현저히 가벼워짐) OR (빈 통 무게(820000) 근처로 돌아감)
             // reference_weight - current_weight > THRESHOLD : 기준보다 무게가 많이 빠짐
             
-            if ((reference_weight - current_weight) > THRESHOLD)
+            
+            if (ABS(reference_weight - current_weight) > THRESHOLD)
             {
                 // 도난 발생!!
                 USART2_SendString("WARNING: THEFT DETECTED!\r\n");
