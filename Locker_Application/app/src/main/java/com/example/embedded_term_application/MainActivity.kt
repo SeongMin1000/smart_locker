@@ -12,7 +12,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -20,7 +19,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
-import android.text.InputType
 import android.util.Log
 import android.view.View
 import android.view.WindowManager
@@ -42,22 +40,22 @@ import kotlin.collections.ArrayList
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        // 블루투스 SPP UUID (표준)
         val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         const val MESSAGE_READ = 0
-        const val CHANNEL_ID = "SAFE_GUARD_ALERT_CHANNEL"
+        const val CHANNEL_ID = "SAFE_GUARD_URGENT_ALARM"
     }
 
+    // UI 요소 선언
     private lateinit var btnBluetoothConnect: Button
     private lateinit var tvStatusText: TextView
     private lateinit var btnLock: Button
-    private lateinit var btnSettings: Button
     private lateinit var ivStatusIcon: ImageView
     private lateinit var btnRefreshLog: Button
     private lateinit var btnShareLog: Button
-    private lateinit var btnZero: Button
-    private lateinit var cbShowRx: CheckBox // [추가] Raw Data 체크박스
+    private lateinit var cbShowRx: CheckBox
 
-    // 센서 UI
+    // 센서 표시용 UI
     private lateinit var tvValTemp: TextView
     private lateinit var tvValPressure: TextView
     private lateinit var tvValFlame: TextView
@@ -66,6 +64,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvLogResult: TextView
     private lateinit var svLogContainer: ScrollView
 
+    // 블루투스 관련 변수
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var connectThread: ConnectThread? = null
     private var connectedThread: ConnectedThread? = null
@@ -76,16 +75,10 @@ class MainActivity : AppCompatActivity() {
     private var scanDialog: AlertDialog? = null
 
     // 상태 변수
-    private var prevPressure = -1
-    private var prevFlame = -1
     private var isLocked = true
+    private var isEmergencyDialogShowing = false // 팝업 중복 방지
 
-    // 설정값
-    private lateinit var prefs: SharedPreferences
-    private var thresholdHigh = 50
-    private var thresholdLow = 10
-    private var pressureOffset = 0
-
+    // 권한 요청 런처
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -99,6 +92,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 블루투스 스캔 리시버
     private val receiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
         override fun onReceive(context: Context, intent: Intent) {
@@ -128,12 +122,10 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // 앱 실행 중 화면 꺼짐 방지
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        createNotificationChannel()
 
-        prefs = getSharedPreferences("SafeGuardPrefs", Context.MODE_PRIVATE)
-        thresholdHigh = prefs.getInt("THRESHOLD_HIGH", 50)
-        thresholdLow = prefs.getInt("THRESHOLD_LOW", 10)
+        createNotificationChannel()
 
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
@@ -141,6 +133,7 @@ class MainActivity : AppCompatActivity() {
         initViews()
         setUiDisconnectedState()
 
+        // 버튼 리스너 설정
         btnBluetoothConnect.setOnClickListener {
             if (connectedThread != null) {
                 stopConnection()
@@ -169,19 +162,7 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent.createChooser(shareIntent, "로그 공유하기"))
         }
 
-        btnZero.setOnClickListener {
-            try {
-                val currentText = tvValPressure.text.toString()
-                val currentVal = currentText.toIntOrNull() ?: 0
-                pressureOffset += currentVal
-
-                addLog("[보정] 압력 센서 영점 조절 완료. (Offset: $pressureOffset)")
-                Toast.makeText(this, "현재 값을 0으로 설정했습니다.", Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                Toast.makeText(this, "센서 값이 유효하지 않습니다.", Toast.LENGTH_SHORT).show()
-            }
-        }
-
+        // [잠금/해제] 버튼
         btnLock.setOnClickListener {
             if (connectedThread == null) {
                 addLog("[오류] 장치가 연결되지 않았습니다.")
@@ -193,23 +174,19 @@ class MainActivity : AppCompatActivity() {
                 sendData("CMD:UNLOCK\n")
                 isLocked = false
                 updateLockUI()
-                addLog("[명령] 잠금 해제 요청 보냄")
+                addLog("[명령] 잠금 해제 요청")
             } else {
                 sendData("CMD:LOCK\n")
                 isLocked = true
                 updateLockUI()
-                addLog("[명령] 잠금 요청 보냄")
+                addLog("[명령] 잠금 요청")
             }
-        }
-
-        btnSettings.setOnClickListener {
-            showSettingsDialog()
         }
 
         val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
         registerReceiver(receiver, filter)
 
-        addLog("앱 시작. (도난 기준: $thresholdLow 이하 / 감지 기준: $thresholdHigh 이상)")
+        addLog("앱이 준비되었습니다.")
     }
 
     override fun onDestroy() {
@@ -229,17 +206,15 @@ class MainActivity : AppCompatActivity() {
         btnShareLog = findViewById(R.id.btnShareLog)
 
         btnLock = findViewById(R.id.btnLock)
-        btnSettings = findViewById(R.id.btnSettings)
-        btnZero = findViewById(R.id.btnZero)
         ivStatusIcon = findViewById(R.id.ivStatusIcon)
 
-        // [추가] 체크박스 연결
-        cbShowRx = findViewById(R.id.cbShowRx)
+        cbShowRx = findViewById(R.id.cbShowRx) // Raw Data 체크박스
 
         val cardTemp = findViewById<View>(R.id.cardTemp)
         cardTemp.findViewById<TextView>(R.id.tvSensorLabel).text = "Temperature"
         tvValTemp = cardTemp.findViewById(R.id.tvSensorValue)
 
+        val cardPressure = findViewById<View>(R.id.cardPressure)
         tvValPressure = findViewById(R.id.tvValPressure)
 
         val cardFlame = findViewById<View>(R.id.cardFlame)
@@ -249,62 +224,28 @@ class MainActivity : AppCompatActivity() {
         updateLockUI()
     }
 
-    private fun showSettingsDialog() {
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("도난 감지 설정")
+    // [경고 팝업] 빨간색 도난 경보창
+    private fun showEmergencyPopup() {
+        if (isEmergencyDialogShowing) return
 
-        val layout = LinearLayout(this)
-        layout.orientation = LinearLayout.VERTICAL
-        layout.setPadding(50, 40, 50, 10)
+        runOnUiThread {
+            isEmergencyDialogShowing = true
 
-        val tvHigh = TextView(this)
-        tvHigh.text = "물건 감지 기준값 (현재: $thresholdHigh)"
-        layout.addView(tvHigh)
+            val builder = AlertDialog.Builder(this)
+            builder.setTitle("🚨 도난 경보 발령 🚨")
+            builder.setMessage("보관함에서 물건 도난이 감지되었습니다!\n즉시 확인하십시오.")
+            builder.setIcon(android.R.drawable.ic_dialog_alert)
+            builder.setCancelable(false)
 
-        val inputHigh = EditText(this)
-        inputHigh.inputType = InputType.TYPE_CLASS_NUMBER
-        inputHigh.hint = "예: 50"
-        inputHigh.setText(thresholdHigh.toString())
-        layout.addView(inputHigh)
-
-        val tvLow = TextView(this)
-        tvLow.text = "\n도난 판단 기준값 (현재: $thresholdLow)"
-        layout.addView(tvLow)
-
-        val inputLow = EditText(this)
-        inputLow.inputType = InputType.TYPE_CLASS_NUMBER
-        inputLow.hint = "예: 10"
-        inputLow.setText(thresholdLow.toString())
-        layout.addView(inputLow)
-
-        builder.setView(layout)
-
-        builder.setPositiveButton("저장") { dialog, _ ->
-            val newHigh = inputHigh.text.toString().toIntOrNull()
-            val newLow = inputLow.text.toString().toIntOrNull()
-
-            if (newHigh != null && newLow != null) {
-                if (newHigh > newLow) {
-                    thresholdHigh = newHigh
-                    thresholdLow = newLow
-
-                    val editor = prefs.edit()
-                    editor.putInt("THRESHOLD_HIGH", thresholdHigh)
-                    editor.putInt("THRESHOLD_LOW", thresholdLow)
-                    editor.apply()
-
-                    addLog("[설정] 기준값 변경됨 (감지: $thresholdHigh / 도난: $thresholdLow)")
-                    Toast.makeText(this, "설정이 저장되었습니다.", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(this, "감지 기준이 도난 기준보다 커야 합니다.", Toast.LENGTH_LONG).show()
-                }
-            } else {
-                Toast.makeText(this, "올바른 숫자를 입력해주세요.", Toast.LENGTH_SHORT).show()
+            builder.setPositiveButton("확인") { dialog, _ ->
+                isEmergencyDialogShowing = false
+                dialog.dismiss()
             }
-        }
-        builder.setNegativeButton("취소") { dialog, _ -> dialog.cancel() }
 
-        builder.show()
+            val dialog = builder.create()
+            dialog.show()
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.RED)
+        }
     }
 
     private fun updateLockUI() {
@@ -483,9 +424,6 @@ class MainActivity : AppCompatActivity() {
             setUiConnectedState()
         }
         addLog("연결 성공! 데이터 수신 대기 중...")
-
-        prevPressure = -1
-        prevFlame = -1
     }
 
     private inner class ConnectedThread(private val socket: BluetoothSocket) : Thread() {
@@ -554,79 +492,80 @@ class MainActivity : AppCompatActivity() {
     // =========================================================================
     // 데이터 파싱 및 알림 로직 (설정된 임계값 사용)
     // =========================================================================
+// =========================================================================
+    // 데이터 파싱 및 알림 로직 (수정됨)
+    // 데이터 형식: "T=25,W=500,F=0" (온도, 압력, 불꽃)
+    // =========================================================================
     private fun parseAndDisplay(data: String) {
-        // [수정] 체크박스가 켜져있으면 Raw Data 로그 출력
+        // 1. Raw Data 보기 체크 시 로그 출력
         if (cbShowRx.isChecked) {
             addLog("[RX] $data")
         }
 
-        if (data.isEmpty()) return
+        val cleanData = data.trim() // 앞뒤 공백 및 개행문자 제거
+        if (cleanData.isEmpty()) return
 
+        // 2. [최우선] 도난 경보 메시지 처리
+        if (cleanData.contains("WARNING: THEFT DETECTED")) {
+            addLog("⚠️ [도난 경보] STM32에서 도난 감지됨!")
+            sendNotification("도난 경보", "보관함에서 물건이 제거되었습니다!")
+            showEmergencyPopup()
+            return
+        }
+
+        // 3. 센서 데이터 파싱 (콤마로 구분)
         try {
-            val parts = data.split("/")
+            // "T=25,W=500,F=0" -> ["T=25", "W=500", "F=0"] 로 분리
+            val tokens = cleanData.split(",")
 
-            val validColor = Color.BLACK
-            val alertColor = Color.RED
+            for (token in tokens) {
+                val t = token.trim() // 혹시 모를 공백 제거
 
-            for (part in parts) {
-                val keyValue = part.split(":")
-                if (keyValue.size == 2) {
-                    val key = keyValue[0].trim().uppercase()
-                    val valueStr = keyValue[1].trim()
+                when {
+                    // [온도] Temperature
+                    t.startsWith("T=") -> {
+                        val valueStr = t.substring(2) // "T=" 제거
+                        tvValTemp.text = "$valueStr °C"
+                        tvValTemp.setTextColor(Color.BLACK)
+                    }
 
-                    if (valueStr.isEmpty()) continue
-
-                    when (key) {
-                        "TEMP" -> {
-                            tvValTemp.text = "$valueStr C"
-                            tvValTemp.setTextColor(validColor)
+                    // [압력/무게] Weight/Pressure
+                    t.startsWith("W=") -> {
+                        val valueStr = t.substring(2) // "W=" 제거
+                        if(valueStr.toInt() < 150000){
+                            tvValPressure.text = "정상"
+                            tvValPressure.setTextColor(Color.GREEN)
                         }
-                        "PRES" -> {
-                            val rawPres = valueStr.toIntOrNull() ?: 0
-                            val adjustedPres = rawPres - pressureOffset
-                            val displayPres = if (adjustedPres < 0) 0 else adjustedPres
-
-                            tvValPressure.text = displayPres.toString()
-                            tvValPressure.setTextColor(validColor)
-
-                            if (prevPressure != -1) {
-                                if (prevPressure > thresholdHigh && displayPres < thresholdLow) {
-                                    addLog("[도난 경보] 물건 제거 감지됨! (압력: $displayPres)")
-                                    sendNotification("도난 경보", "보관함에서 물건이 제거되었습니다!")
-                                }
-                                if (prevPressure < thresholdLow && displayPres > thresholdHigh) {
-                                    addLog("[보관 감지] 물건 보관됨. (압력: $displayPres)")
-                                }
-                            }
-                            prevPressure = displayPres
+                        else{
+                            tvValPressure.text = "비정상"
+                            tvValPressure.setTextColor(Color.RED)
                         }
-                        "FLAME" -> {
-                            val currentFlame = valueStr.toIntOrNull() ?: 0
 
-                            if (currentFlame == 1) {
-                                tvValFlame.text = "DETECTED"
-                                tvValFlame.setTextColor(alertColor)
+                    }
 
-                                if (prevFlame != 1) {
-                                    addLog("[화재 경보] 불꽃 감지됨!")
-                                    sendNotification("화재 경보", "불꽃이 감지되었습니다! 확인이 필요합니다.")
-                                }
-                            } else {
-                                tvValFlame.text = "SAFE"
-                                tvValFlame.setTextColor(Color.parseColor("#4CAF50"))
+                    // [불꽃] Flame (0: 안전, 1: 화재 로 가정)
+                    t.startsWith("F=") -> {
+                        val valueStr = t.substring(2) // "F=" 제거
+                        val flameValue = valueStr.toIntOrNull() ?: 0
 
-                                if (prevFlame == 1) {
-                                    addLog("[화재 해제] 상태 안전.")
-                                }
-                            }
-                            prevFlame = currentFlame
+                        if (flameValue >= 1) { // 화재 감지 시 (값이 1 이상일 때)
+                            tvValFlame.text = "안전 ($valueStr)"
+                            tvValFlame.setTextColor(Color.BLUE)
+
+                            // 화재 알림이 필요하다면 아래 주석 해제
+                            // sendNotification("화재 경고", "불꽃이 감지되었습니다!")
+                        } else {
+                            tvValFlame.text = "감지됨 ($valueStr)"
+                            tvValFlame.setTextColor(Color.RED)
                         }
                     }
                 }
             }
-        } catch (e: Exception) { }
+        } catch (e: Exception) {
+            // 파싱 중 에러 발생 시 로그만 남기고 앱이 죽지 않도록 함
+            Log.e("ParseError", "데이터 파싱 실패: ${e.message}")
+        }
     }
-
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val name = "SmartSafeGuard Alerts"
