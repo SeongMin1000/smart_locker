@@ -49,7 +49,7 @@ volatile long g_debug_weight_diff = 0;    // 무게 차이 (절대값)
 
 // 4. 로드셀 설정값
 const long EMPTY_WEIGHT = 826000; // 캘리브레이션 값
-const long THRESHOLD = 50000;    // 도난 판단 임계값
+const long THRESHOLD = 30000;    // 도난 판단 임계값
 
 // 5. 시스템 상태
 typedef enum {
@@ -594,3 +594,4 @@ int main(void)
     }
 
 }
+
