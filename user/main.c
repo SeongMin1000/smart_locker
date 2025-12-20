@@ -17,7 +17,7 @@
 // 1. 통신 관련
 #define MAX_RX_BUF 64
 #define ABS(x) ((x) < 0 ? -(x) : (x))
-#define VIB_THRESHOLD_5SEC  15
+#define VIB_THRESHOLD_5SEC  500
 
 // [main 함수 밖 전역 변수 선언]
 volatile uint8_t g_theft_msg_sent = 0; // 도난 메시지 보냈는지 체크
@@ -497,7 +497,7 @@ int main(void)
             DHT11_Read_Data(&g_debug_temp, &g_debug_humi);
             
             char combined_msg[64];
-            sprintf(combined_msg, "T=%d, W=%ld, F=%d\n", g_debug_temp, g_debug_weight_diff, g_debug_flame);
+            sprintf(combined_msg, "T=%d\n", g_debug_temp);
             USART2_SendString(combined_msg);
             
             g_send_temp_flag = 0;
@@ -574,7 +574,6 @@ int main(void)
                         Delay_ms(100);       
                     }
                     USART2_SendString("WARNING: THEFT DETECTED!\r\n");
-                    // Delay_ms(5000); // 딜레이 제거 권장 (블로킹 방지) 혹은 필요시 유지
                     
                     g_theft_msg_sent = 1; // 보냄 표시 (잠금)
                 }
