@@ -1,18 +1,25 @@
+# Android & Gradle
 .gradle/
 build/
-
 local.properties
-
 proguard-project.txt
-
 .idea/
 *.iml
 *.ipr
 *.iws
 
+# System & IDE
 .DS_Store
 Thumbs.db
-
 captures/
-
 .externalNativeBuild
+
+# IAR Embedded Workbench
+settings/
+*.Debug.*
+*.dnx
+*.wsdt
+*.dbgdt
+*.crun
+*.ewd.bak
+*.ewp.bak
