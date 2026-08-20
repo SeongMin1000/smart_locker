@@ -53,6 +53,76 @@ graph TD
 
 ---
 
+## 🔄 전체 동작 시퀀스 (Operation Sequence Diagram)
+
+시스템의 전체적인 동작 흐름(연결 ➔ 보관 & 잠금 ➔ 모니터링 ➔ 비상 경보 ➔ 잠금 해제) 시퀀스는 다음과 같습니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as 사용자
+    participant App as Android App
+    participant MCU as STM32 MCU
+    participant Servo as Servo Motor
+    participant Sensor as Sensors (LoadCell/EXTI)
+
+    rect rgb(240, 248, 255)
+        note over User, MCU: 1. 시스템 연결 & 초기화
+        User->>App: 블루투스 장치 검색 & 연결
+        App->>MCU: Bluetooth SPP 연결 확립
+        MCU->>MCU: HX711 영점(Tare) 조절 & 초기화
+    end
+
+    rect rgb(240, 255, 240)
+        note over User, Sensor: 2. 보관 & 잠금 (Locking Phase)
+        User->>User: 사물함에 물품 보관
+        User->>App: [LOCK] 버튼 클릭
+        App->>MCU: "CMD:LOCK" 전송
+        MCU->>Servo: PWM 2400us (사물함 잠금)
+        MCU->>Sensor: 현재 무게를 기준 무게(Ref Weight)로 저장
+        MCU-->>App: "OK: LOCKED (Ref: XXX)" 수신
+    end
+
+    rect rgb(255, 250, 240)
+        note over MCU, App: 3. 실시간 모니터링 & 주기적 전송
+        loop 5초 주기 (TIM4 Timer)
+            MCU->>MCU: DHT11 온습도 측정
+            MCU-->>App: "T=XX" 전송 (앱 온도 UI 갱신)
+        end
+    end
+
+    rect rgb(255, 240, 240)
+        note over Sensor, App: 4. 비상 상황 발생 (Emergency Event)
+        alt 도난 발생 (무게 급감)
+            Sensor->>MCU: 무게 차이 > 30,000 (THRESHOLD)
+            MCU->>MCU: 부저/LED 5회 점등
+            MCU-->>App: "WARNING: THEFT DETECTED!" 전송
+            App->>User: 푸시 알림 + 비상 팝업 생성
+        else 화재 발생 (불꽃 감지)
+            Sensor->>MCU: EXTI3 Line 3 Falling Edge
+            MCU->>MCU: 부저/LED 5회 점등
+            MCU-->>App: "WARNING: FLAME DETECTED!" 전송
+            App->>User: 푸시 알림 + 비상 팝업 생성
+        else 이동 감지 (진동 감지)
+            Sensor->>MCU: EXTI1 Line 1 5초간 > 500회 카운트
+            MCU->>MCU: 부저/LED 5회 점등
+            MCU-->>App: "WARNING: MOVING DETECTED!" 전송
+            App->>User: 푸시 알림 + 비상 팝업 생성
+        end
+    end
+
+    rect rgb(240, 248, 255)
+        note over User, Servo: 5. 잠금 해제 & 물품 수거 (Unlocking Phase)
+        User->>App: [UNLOCK] 버튼 클릭
+        App->>MCU: "CMD:UNLOCK" 전송
+        MCU->>Servo: PWM 1500us (사물함 잠금 해제)
+        MCU->>MCU: 도난/경보 플래그 초기화
+        MCU-->>App: "OK: UNLOCKED" 수신
+    end
+```
+
+---
+
 ## 🛠️ 기술 스택 (Tech Stack)
 
 ### Firmware (Hardware & Embedded)
